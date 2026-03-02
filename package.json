@@ -1,0 +1,59 @@
+{
+    "name": "bbox-mcp-server",
+    "version": "1.1.0",
+    "description": "MCP server for bounding box coordinate conversion, EPSG projections, Uber H3 hexagonal indexing, and shareable map links",
+    "type": "module",
+    "license": "MIT",
+    "author": "Vibhor Singh",
+    "homepage": "https://vibhorsingh.com/boundingbox/",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/iamvibhorsingh/bbox-mcp-server"
+    },
+    "keywords": [
+        "mcp",
+        "mcp-server",
+        "model-context-protocol",
+        "bounding-box",
+        "bbox",
+        "gis",
+        "geospatial",
+        "coordinates",
+        "epsg",
+        "proj4",
+        "h3",
+        "hexagonal-grid",
+        "wkt",
+        "geojson"
+    ],
+    "bin": {
+        "bbox-mcp-server": "./dist/index.js"
+    },
+    "files": [
+        "dist",
+        "proj4defs.json",
+        "README.md"
+    ],
+    "scripts": {
+        "build": "tsc",
+        "start": "node dist/index.js",
+        "dev": "npm run build && npm run start",
+        "test": "npm run build && node --test test.js",
+        "prepublishOnly": "npm run build"
+    },
+    "dependencies": {
+        "@modelcontextprotocol/sdk": "^1.6.1",
+        "@terraformer/wkt": "^2.2.1",
+        "h3-js": "^4.1.0",
+        "proj4": "^2.15.0"
+    },
+    "devDependencies": {
+        "@types/node": "^22.13.5",
+        "@types/proj4": "^2.5.5",
+        "@types/terraformer__wkt": "^2.0.3",
+        "typescript": "^5.7.3"
+    },
+    "engines": {
+        "node": ">=18.0.0"
+    }
+}
