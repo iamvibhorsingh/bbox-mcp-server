@@ -16,7 +16,7 @@ import proj4defs from "./proj4defs.json" with { type: "json" };
 import { wktToGeoJSON as parseWKT } from "@terraformer/wkt";
 
 const SERVER_NAME = "bbox-mcp-server";
-const SERVER_VERSION = "1.1.0";
+const SERVER_VERSION = "1.2.1";
 
 const MAX_H3_CELLS = process.env.MAX_H3_CELLS ? parseInt(process.env.MAX_H3_CELLS, 10) : 50000;
 const MAPBOX_ACCESS_TOKEN = process.env.MAPBOX_ACCESS_TOKEN;
@@ -285,11 +285,22 @@ async function ensureProjection(epsg: string): Promise<void> {
     }
 }
 
-function getFormattedBox(bbox: BBox, format: string, precision: number = 6): string {
-    const xmin = bbox.lng1.toFixed(precision);
-    const ymin = bbox.lat1.toFixed(precision);
-    const xmax = bbox.lng2.toFixed(precision);
-    const ymax = bbox.lat2.toFixed(precision);
+function getFormattedBox(bbox: BBox, format: string, precision: number = 6, coordOrder: "lng,lat" | "lat,lng" = "lng,lat"): string {
+    let xmin, ymin, xmax, ymax;
+
+    if (coordOrder === "lat,lng") {
+        // Swap X and Y coordinates
+        xmin = bbox.lat1.toFixed(precision);
+        ymin = bbox.lng1.toFixed(precision);
+        xmax = bbox.lat2.toFixed(precision);
+        ymax = bbox.lng2.toFixed(precision);
+    } else {
+        // Default lng,lat order
+        xmin = bbox.lng1.toFixed(precision);
+        ymin = bbox.lat1.toFixed(precision);
+        xmax = bbox.lng2.toFixed(precision);
+        ymax = bbox.lat2.toFixed(precision);
+    }
 
     switch (format.toLowerCase()) {
         case 'wkt':
@@ -344,6 +355,14 @@ function calculateBboxDimensions(bbox: BBox): { widthKm: number, heightKm: numbe
 function calculateBboxArea(bbox: BBox): number {
     const { widthKm, heightKm } = calculateBboxDimensions(bbox);
     return widthKm * heightKm;
+}
+
+function latLngToTile(lat: number, lng: number, zoom: number): { z: number, x: number, y: number } {
+    const n = Math.pow(2, zoom);
+    const x = Math.floor((lng + 180) / 360 * n);
+    const latRad = lat * Math.PI / 180;
+    const y = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n);
+    return { z: zoom, x, y };
 }
 
 function buildShareUrl(bbox: BBox): string {
@@ -507,6 +526,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                             description: "Format of the output. Options: wkt, geojson-bbox, leaflet, overpass, ogc-bbox, kml, geojson-polygon, csv, stac-bbox. Default: csv.",
                             enum: ["wkt", "geojson-bbox", "leaflet", "overpass", "ogc-bbox", "kml", "geojson-polygon", "csv", "stac-bbox"]
                         },
+                        coord_order: {
+                            type: "string",
+                            description: "Toggle between 'lng,lat' (default) and 'lat,lng' coordinate ordering in the formatted output. Useful for APIs that expect swapped coordinate orders.",
+                            enum: ["lng,lat", "lat,lng"]
+                        },
+                        zoom: {
+                            type: "number",
+                            description: "The map zoom level (0-22) used to calculate the map tile coordinates for the centroid. Defaults to 15."
+                        },
                         precision: {
                             type: "number",
                             description: "The number of decimal places to output coordinate strings as (defaults to 6)."
@@ -565,6 +593,80 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                     },
                     required: ["bbox"],
                 },
+            },
+            {
+                name: "search_overpass",
+                description: "Execute an Overpass QL query to find POIs, roads, or other OSM features within a bounding box. You must provide the base query. The server automatically wraps it in a bbox filter and returns structured JSON.\n\nCOMMON TAG EXAMPLES:\n- Restaurants: `nwr[\"amenity\"=\"restaurant\"]`\n- Pizza: `nwr[\"amenity\"=\"fast_food\"][\"cuisine\"=\"pizza\"]`\n- Supermarkets: `nwr[\"shop\"=\"supermarket\"]`\n- Parks: `nwr[\"leisure\"=\"park\"]`\n- Hospitals: `nwr[\"amenity\"=\"hospital\"]`\n- Schools: `nwr[\"amenity\"=\"school\"]`\n- Parking: `nwr[\"amenity\"=\"parking\"]`\n- Highways/Roads: `way[\"highway\"]`",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        location: {
+                            type: "string",
+                            description: "A text location to search for (e.g. 'San Francisco'). Requires MAPBOX_ACCESS_TOKEN env var. Either 'location' or 'bbox' MUST be provided."
+                        },
+                        bbox: {
+                            type: "string",
+                            description: "The geometry to parse. Can be a raw bounding box string ('lat1,lng1,lat2,lng2'), WKT, GeoJSON, or ogrinfo extent. Either 'location' or 'bbox' MUST be provided.",
+                        },
+                        query: {
+                            type: "string",
+                            description: "The Overpass QL core query. Example: `node[\"amenity\"=\"cafe\"]` or `nwr[\"leisure\"=\"park\"]`. DO NOT include the bounding box `(S,W,N,E)` or output format (`out json`), the server handles that automatically."
+                        },
+                        limit: {
+                            type: "number",
+                            description: "Maximum number of elements to return. Helps prevent enormous JSON responses. Default is 100. Set to a higher number if you need more results."
+                        }
+                    },
+                    required: ["query"],
+                    oneOf: [
+                        { required: ["location"] },
+                        { required: ["bbox"] }
+                    ]
+                },
+            },
+            {
+                name: "list_osm_tags",
+                description: "Discovery tool to look up the correct OpenStreetMap tags for a given category. Helps prevent hallucinating incorrect tags before writing an Overpass query.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        category: {
+                            type: "string",
+                            description: "Broad category to look up (e.g. 'food', 'health', 'transport', 'leisure', 'retail')."
+                        }
+                    },
+                    required: ["category"]
+                }
+            },
+            {
+                name: "aggregate_overpass_h3",
+                description: "Executes an Overpass query and bins the results into H3 hexagons at a specified resolution to analyze spatial density.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        location: {
+                            type: "string",
+                            description: "A text location to search for (e.g. 'Seattle')."
+                        },
+                        bbox: {
+                            type: "string",
+                            description: "The bounding box geometry to parse."
+                        },
+                        query: {
+                            type: "string",
+                            description: "The Overpass QL core query (e.g. `nwr[\"amenity\"=\"cafe\"]`)."
+                        },
+                        resolution: {
+                            type: "number",
+                            description: "The H3 resolution level (0-15) for binning. Default is 8."
+                        }
+                    },
+                    required: ["query", "resolution"],
+                    oneOf: [
+                        { required: ["location"] },
+                        { required: ["bbox"] }
+                    ]
+                }
             }
         ],
     };
@@ -599,6 +701,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
             let epsg = args.epsg as string || "4326";
             let format = args.format as string || "csv";
+            let coordOrder = (args.coord_order as "lng,lat" | "lat,lng") || "lng,lat";
+            let zoom = args.zoom as number || 15;
             let precision = args.precision as number || 6;
 
             epsg = epsg.replace(/[^0-9]/g, "");
@@ -607,7 +711,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             await ensureProjection(epsg);
 
             const projCoords = projectBounds(bboxObj, epsg);
-            const WGS84Formatted = getFormattedBox(bboxObj, format, precision);
+            const WGS84Formatted = getFormattedBox(bboxObj, format, precision, coordOrder);
 
             // Build projected bbox for formatting (uses projected values)
             const projBbox: BBox = {
@@ -617,11 +721,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 lng2: projCoords.xmax
             };
 
-            const projectedFormatted = getFormattedBox(projBbox, format, precision);
+            const projectedFormatted = getFormattedBox(projBbox, format, precision, coordOrder);
             const shareUrl = buildShareUrl(bboxObj);
 
             const dims = calculateBboxDimensions(bboxObj);
             const areaKm2 = calculateBboxArea(bboxObj);
+
+            // Calculate center and tile indices based on WGS84 original bounds
+            const centerLat = (bboxObj.lat1 + bboxObj.lat2) / 2;
+            const centerLng = (bboxObj.lng1 + bboxObj.lng2) / 2;
+            const tileIndices = latLngToTile(centerLat, centerLng, zoom);
 
             log('info', `get_bounds completed`, { epsg, format, area_km2: areaKm2 });
 
@@ -636,8 +745,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         text: JSON.stringify({
                             original_wgs84: bboxObj,
                             projected: projCoords,
+                            center: {
+                                lat: centerLat,
+                                lng: centerLng
+                            },
+                            tile_indices: tileIndices,
                             epsg,
                             format,
+                            coord_order: coordOrder,
                             precision,
                             area_km2: areaKm2,
                             dimensions: {
@@ -735,6 +850,350 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                             bbox: bboxObj,
                             share_url: shareUrl
                         }, null, 2)
+                    }
+                ]
+            };
+        }
+
+        else if (toolName === "search_overpass") {
+            const args = request.params.arguments || {};
+            const queryRaw = args.query as string;
+            const limit = args.limit as number || 100;
+
+            if (!queryRaw) {
+                return { content: [{ type: "text", text: "Error: 'query' is required (e.g. `node[\"amenity\"=\"restaurant\"]`)." }], isError: true };
+            }
+
+            if (queryRaw.length > 2000) {
+                return { content: [{ type: "text", text: "Error: Query is too long (maximum 2000 characters)." }], isError: true };
+            }
+
+            if (queryRaw.includes("[out:") || queryRaw.includes("[timeout:") || queryRaw.includes("[bbox:")) {
+                return { content: [{ type: "text", text: "Error: Query must not contain direct [out:], [timeout:], or [bbox:] directives. The server handles these automatically." }], isError: true };
+            }
+
+            let bboxObj: BBox;
+            if (args.location) {
+                try {
+                    bboxObj = await geocodeLocation(args.location as string);
+                } catch (err: any) {
+                    if (!args.bbox) {
+                        log('error', `Geocoding failed for overpass location: ${args.location}`, { error: err.message });
+                        return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
+                    }
+                    bboxObj = parseBBox(args.bbox as string);
+                }
+            } else if (args.bbox) {
+                bboxObj = parseBBox(args.bbox as string);
+            } else {
+                return { content: [{ type: "text", text: "Error: Either 'location' or 'bbox' argument must be provided." }], isError: true };
+            }
+
+            log('info', `search_overpass starting`, { query: queryRaw });
+
+            const overpassQuery = `[out:json][timeout:25][bbox:${bboxObj.lat1},${bboxObj.lng1},${bboxObj.lat2},${bboxObj.lng2}];\n(${queryRaw};);\nout center;`;
+
+            const endpoints = [
+                "https://overpass-api.de/api/interpreter",
+                "https://overpass.kumi.systems/api/interpreter"
+            ];
+
+            if (process.env.OVERPASS_API_URL) {
+                endpoints.unshift(process.env.OVERPASS_API_URL);
+            }
+
+            let data: any = null;
+            let lastError: Error | null = null;
+
+            // Formatting payload precisely for Overpass
+            const params = new URLSearchParams();
+            params.append('data', overpassQuery);
+
+            for (const endpoint of endpoints) {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS * 2);
+
+                try {
+                    log('info', `Executing Overpass query at ${endpoint}`);
+                    const response = await fetch(endpoint, {
+                        method: "POST",
+                        body: params.toString(),
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                            'Accept': 'application/json',
+                            'User-Agent': `${SERVER_NAME}/${SERVER_VERSION}`
+                        },
+                        signal: controller.signal
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`Overpass API returned status: ${response.status} ${response.statusText}`);
+                    }
+
+                    data = await response.json();
+                    break; // Success!
+
+                } catch (err: any) {
+                    lastError = err;
+                    log('warn', `Overpass API failed at ${endpoint}`, { error: err.message });
+                } finally {
+                    clearTimeout(timeout);
+                }
+            }
+
+            if (!data) {
+                if (lastError?.name === 'AbortError') {
+                    return { content: [{ type: "text", text: `Error: Overpass API request timed out on all endpoints after ${(FETCH_TIMEOUT_MS * 4) / 1000}s overall. The query might be too broad.` }], isError: true };
+                }
+                throw new Error(`Overpass query failed on all endpoints: ${lastError?.message}`);
+            }
+
+            let rawElements = data.elements || [];
+
+            // Parse raw elements into structured output
+            const seenIds = new Set();
+            let parsedElements = rawElements.reduce((acc: any[], e: any) => {
+                if (seenIds.has(e.id)) return acc;
+                seenIds.add(e.id);
+
+                const lat = e.lat ?? e.center?.lat;
+                const lon = e.lon ?? e.center?.lon;
+
+                // Only keep elements that actually have coordinates and tags (or allow untagged if requested, but structured output is better)
+                if (lat !== undefined && lon !== undefined) {
+                    acc.push({
+                        id: e.id,
+                        type: e.type,
+                        name: e.tags?.name || "Unnamed",
+                        coordinates: { lat, lon },
+                        tags: e.tags || {}
+                    });
+                }
+                return acc;
+            }, []);
+
+            const elementCount = parsedElements.length;
+            let truncated = false;
+
+            if (parsedElements.length > limit) {
+                parsedElements = parsedElements.slice(0, limit);
+                truncated = true;
+            }
+
+            const shareUrl = buildShareUrl(bboxObj);
+
+            log('info', `search_overpass completed`, { elements: elementCount, returned: parsedElements.length, truncated });
+
+            const responseData = {
+                generator: data.generator,
+                osm3s: data.osm3s,
+                elements: parsedElements,
+                total_count: elementCount,
+                returned_count: parsedElements.length,
+                truncated,
+                original_bbox: bboxObj,
+                share_url: shareUrl
+            };
+
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `Successfully executed Overpass query.\nFound ${elementCount} elements${truncated ? ` (truncated to ${limit})` : ''}.\n\nSummary:\n${parsedElements.slice(0, 5).map((e: any) => `- [${e.type}] ${e.id} (${e.name})`).join('\n')}${parsedElements.length > 5 ? '\n... (see JSON for full results)' : ''}\n\nView original bounding box on map: ${shareUrl}`
+                    },
+                    {
+                        type: "text",
+                        text: JSON.stringify(responseData, null, 2)
+                    }
+                ]
+            };
+        }
+
+        else if (toolName === "list_osm_tags") {
+            const args = request.params.arguments || {};
+            const category = (args.category as string || "").toLowerCase();
+
+            let recommendations = "";
+            switch (true) {
+                case category.includes('food') || category.includes('restaurant') || category.includes('cafe'):
+                    recommendations = `Restaurants: nwr["amenity"="restaurant"]\nFast Food: nwr["amenity"="fast_food"]\nCafes: nwr["amenity"="cafe"]\nBars: nwr["amenity"="bar"]\nPubs: nwr["amenity"="pub"]`;
+                    break;
+                case category.includes('health') || category.includes('medical'):
+                    recommendations = `Hospitals: nwr["amenity"="hospital"]\nClinics: nwr["amenity"="clinic"]\nPharmacies: nwr["amenity"="pharmacy"]\nDoctors: nwr["amenity"="doctors"]\nDentists: nwr["amenity"="dentist"]`;
+                    break;
+                case category.includes('transport') || category.includes('transit') || category.includes('traffic'):
+                    recommendations = `Parking: nwr["amenity"="parking"]\nBus Stops: nwr["highway"="bus_stop"]\nSubway Stations: nwr["railway"="station"]["station"="subway"]\nTrain Stations: nwr["railway"="station"]\nBicycle Parking: nwr["amenity"="bicycle_parking"]\nGas Stations: nwr["amenity"="fuel"]`;
+                    break;
+                case category.includes('leisure') || category.includes('park') || category.includes('entertainment'):
+                    recommendations = `Parks: nwr["leisure"="park"]\nPlaygrounds: nwr["leisure"="playground"]\nTheatres: nwr["amenity"="theatre"]\nCinemas: nwr["amenity"="cinema"]\nSports Centres: nwr["leisure"="sports_centre"]`;
+                    break;
+                case category.includes('retail') || category.includes('shop') || category.includes('store'):
+                    recommendations = `Supermarkets: nwr["shop"="supermarket"]\nConvenience Stores: nwr["shop"="convenience"]\nMalls: nwr["shop"="mall"]\nClothes Shops: nwr["shop"="clothes"]\nBakeries: nwr["shop"="bakery"]`;
+                    break;
+                case category.includes('education') || category.includes('school'):
+                    recommendations = `Schools: nwr["amenity"="school"]\nUniversities: nwr["amenity"="university"]\nColleges: nwr["amenity"="college"]\nKindergartens: nwr["amenity"="kindergarten"]\nLibraries: nwr["amenity"="library"]`;
+                    break;
+                case category.includes('tourism') || category.includes('hotel'):
+                    recommendations = `Hotels: nwr["tourism"="hotel"]\nMotels: nwr["tourism"="motel"]\nHostels: nwr["tourism"="hostel"]\nAttractions: nwr["tourism"="attraction"]\nMuseums: nwr["tourism"="museum"]\nInformation: nwr["tourism"="information"]`;
+                    break;
+                default:
+                    recommendations = `Top categories:\n- Food: nwr["amenity"="restaurant"], nwr["amenity"="cafe"]\n- Health: nwr["amenity"="hospital"]\n- Transport: nwr["highway"="bus_stop"], nwr["amenity"="parking"]\n- Leisure: nwr["leisure"="park"]\n- Retail: nwr["shop"="supermarket"]\n- Education: nwr["amenity"="school"]\n\nPlease try searching for one of those broader categories (e.g. "health") for more detailed tag combinations.`;
+                    break;
+            }
+
+            return {
+                content: [{
+                    type: "text",
+                    text: `OSM Tag Recommendations for '${category}':\n\n${recommendations}\n\nTip: You can usually just use these directly as the 'query' argument in search_overpass.`
+                }]
+            };
+        }
+
+        else if (toolName === "aggregate_overpass_h3") {
+            const args = request.params.arguments || {};
+            const queryRaw = args.query as string;
+            const resolution = args.resolution as number || 8;
+
+            if (!queryRaw) {
+                return { content: [{ type: "text", text: "Error: 'query' is required." }], isError: true };
+            }
+
+            let bboxObj: BBox;
+            if (args.location) {
+                try {
+                    bboxObj = await geocodeLocation(args.location as string);
+                } catch (err: any) {
+                    if (!args.bbox) {
+                        return { content: [{ type: "text", text: `Error: Geocoding failed: ${err.message}` }], isError: true };
+                    }
+                    bboxObj = parseBBox(args.bbox as string);
+                }
+            } else if (args.bbox) {
+                bboxObj = parseBBox(args.bbox as string);
+            } else {
+                return { content: [{ type: "text", text: "Error: Either 'location' or 'bbox' argument must be provided." }], isError: true };
+            }
+
+            log('info', `aggregate_overpass_h3 starting`, { query: queryRaw, resolution });
+
+            // Ensure H3 resolution is valid early
+            if (resolution < 0 || resolution > 15 || !Number.isInteger(resolution)) {
+                return { content: [{ type: "text", text: `Error: Invalid H3 resolution: ${resolution}. Must be 0-15.` }], isError: true };
+            }
+
+            const overpassQuery = `[out:json][timeout:25][bbox:${bboxObj.lat1},${bboxObj.lng1},${bboxObj.lat2},${bboxObj.lng2}];\n(${queryRaw};);\nout center;`;
+
+            let data: any = null;
+            let lastError: Error | null = null;
+            const params = new URLSearchParams();
+            params.append('data', overpassQuery);
+
+            const endpoints = [
+                "https://overpass-api.de/api/interpreter",
+                "https://overpass.kumi.systems/api/interpreter"
+            ];
+
+            if (process.env.OVERPASS_API_URL) {
+                endpoints.unshift(process.env.OVERPASS_API_URL);
+            }
+
+            for (const endpoint of endpoints) {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS * 2);
+
+                try {
+                    const response = await fetch(endpoint, {
+                        method: "POST",
+                        body: params.toString(),
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                            'Accept': 'application/json',
+                            'User-Agent': `${SERVER_NAME}/${SERVER_VERSION}`
+                        },
+                        signal: controller.signal
+                    });
+
+                    if (!response.ok) throw new Error(`Status: ${response.status}`);
+                    data = await response.json();
+                    break;
+                } catch (err: any) {
+                    lastError = err;
+                } finally {
+                    clearTimeout(timeout);
+                }
+            }
+
+            if (!data) {
+                return { content: [{ type: "text", text: `Error: Overpass query failed: ${lastError?.message}` }], isError: true };
+            }
+
+            let rawElements = data.elements || [];
+
+            // Bin into H3 Hexagons
+            const hexCounts: Record<string, number> = {};
+            const hexElements: Record<string, any[]> = {};
+
+            const seenIds = new Set();
+            rawElements.forEach((e: any) => {
+                if (seenIds.has(e.id)) return;
+                seenIds.add(e.id);
+
+                const lat = e.lat ?? e.center?.lat;
+                const lon = e.lon ?? e.center?.lon;
+
+                if (lat !== undefined && lon !== undefined) {
+                    const h3Index = h3.latLngToCell(lat, lon, resolution);
+                    hexCounts[h3Index] = (hexCounts[h3Index] || 0) + 1;
+
+                    if (!hexElements[h3Index]) hexElements[h3Index] = [];
+                    // Keep element data minimal to avoid massive payloads
+                    hexElements[h3Index].push({
+                        id: e.id,
+                        name: e.tags?.name || "Unnamed"
+                    });
+                }
+            });
+
+            const shareUrl = buildShareUrl(bboxObj);
+            const totalGrouped = Object.values(hexCounts).reduce((a, b) => a + b, 0);
+
+            // Generate GeoJSON of the active hexes
+            const activeHexes = Object.keys(hexCounts);
+            const geojson = h3CellsToGeoJSON(activeHexes);
+
+            // Inject the counts into the GeoJSON properties
+            (geojson as any).features.forEach((f: any) => {
+                const cellId = f.properties.h3_index;
+                f.properties.count = hexCounts[cellId];
+                f.properties.elements = hexElements[cellId];
+            });
+
+            log('info', `aggregate_overpass_h3 completed`, { resolution, elements: totalGrouped, activeHexes: activeHexes.length });
+
+            const responseData = {
+                resolution,
+                total_elements: totalGrouped,
+                active_hex_count: activeHexes.length,
+                hex_counts: hexCounts,
+                hex_geojson: geojson,
+                original_bbox: bboxObj,
+                share_url: shareUrl
+            };
+
+            // Sort map for display
+            const topHexes = Object.entries(hexCounts)
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 10);
+
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `Aggregated ${totalGrouped} elements into ${activeHexes.length} H3 hexagons at resolution ${resolution}.\n\nTop Hexagons by Density:\n${topHexes.map(([hex, count]) => `- Hex ${hex}: ${count} elements`).join('\n')}\n\nView bounding area on map: ${shareUrl}`
+                    },
+                    {
+                        type: "text",
+                        text: JSON.stringify(responseData, null, 2)
                     }
                 ]
             };

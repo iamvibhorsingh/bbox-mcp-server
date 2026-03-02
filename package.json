@@ -1,7 +1,7 @@
 {
     "name": "bbox-mcp-server",
-    "version": "1.1.0",
-    "description": "MCP server for bounding box coordinate conversion, EPSG projections, Uber H3 hexagonal indexing, and shareable map links",
+    "version": "1.2.1",
+    "description": "MCP server for bounding box coordinate conversion, EPSG projections, Uber H3 hexagonal indexing, Overpass OSM queries, and shareable map links",
     "type": "module",
     "license": "MIT",
     "author": "Vibhor Singh",
@@ -24,7 +24,11 @@
         "h3",
         "hexagonal-grid",
         "wkt",
-        "geojson"
+        "geojson",
+        "overpass",
+        "osm",
+        "openstreetmap",
+        "poi"
     ],
     "bin": {
         "bbox-mcp-server": "./dist/index.js"

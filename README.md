@@ -1,30 +1,47 @@
-# bbox-mcp-server
+# 🌍 bbox-mcp-server
 
-An [MCP](https://modelcontextprotocol.io/) server that gives AI agents geospatial superpowers — coordinate conversion, EPSG projections, H3 indexing, and shareable map links.
+The geospatial toolkit for AI agents. **6 tools, zero config** — give any LLM the ability to parse, convert, query, and aggregate spatial data out of the box.
 
-Every response includes a link to [vibhorsingh.com/boundingbox](https://vibhorsingh.com/boundingbox/) so you can visually verify results on an interactive map.
+Every response includes a verification link to **[vibhorsingh.com/boundingbox](https://vibhorsingh.com/boundingbox/)** so you can visually confirm results on an interactive map.
 
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-green)](https://nodejs.org/) [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
 ---
 
-## Why use this?
+## Why This Exists
 
-- **Parse any coordinate format** — raw coords, WKT, GeoJSON, or `ogrinfo` output
-- **Project to 3900+ coordinate systems** — unknown codes auto-fetched from [epsg.io](https://epsg.io)
-- **Generate H3 hex grids** — cell IDs + optional GeoJSON boundaries
-- **Visual verification** — every response links to the [Bounding Box tool](https://vibhorsingh.com/boundingbox/) with coords pre-loaded
+| The problem | How bbox-mcp solves it |
+|---|---|
+| *"I have WKT but the API needs a GeoJSON bbox in EPSG:3857."* | Parses 6 input formats, projects to 3,900+ EPSG codes, outputs in 9 formats — in one call. |
+| *"I keep getting the wrong OSM tags for Overpass queries."* | `list_osm_tags` returns curated tag combos. No more hallucinated `amenity=grocery`. |
+| *"How many hospitals are in this district?"* | `aggregate_overpass_h3` queries Overpass and bins results into H3 hexagons server-side. |
+| *"Is this bounding box actually correct?"* | Every response includes a clickable map link for visual verification. |
+
+---
+
+## Tools at a Glance
+
+| Tool | What it does | Key params |
+|---|---|---|
+| `get_bounds` | Convert and project a bbox across formats and coordinate systems | `bbox`, `epsg`, `format`, `coord_order`, `zoom` |
+| `get_h3_indices` | Generate H3 hex cell indices covering a bbox | `bbox`, `resolution`, `compact` |
+| `generate_share_url` | Create a shareable map link for a bbox | `bbox` |
+| `search_overpass` | Query OpenStreetMap via Overpass QL | `bbox`, `query`, `limit` |
+| `list_osm_tags` | Look up correct OSM tags for a category | `category` |
+| `aggregate_overpass_h3` | Run an Overpass query and bin results into H3 hexagons | `bbox`, `query`, `resolution` |
+
+All tools accept `location` (natural language, requires Mapbox token) or `bbox` (coordinates, WKT, GeoJSON, etc).
 
 ---
 
 ## Quick Start
 
-Add the server to your MCP client config — **no install, no API keys required**.
+Add to your MCP client config:
 
-### Claude Desktop
+<details>
+<summary><b>Claude Desktop</b> <i>(Click to expand)</i></summary>
 
 Add to `claude_desktop_config.json`:
-
 ```json
 {
   "mcpServers": {
@@ -35,11 +52,12 @@ Add to `claude_desktop_config.json`:
   }
 }
 ```
+</details>
 
-### Cursor
+<details>
+<summary><b>Cursor</b> <i>(Click to expand)</i></summary>
 
 Add to `.cursor/mcp.json`:
-
 ```json
 {
   "mcpServers": {
@@ -50,11 +68,12 @@ Add to `.cursor/mcp.json`:
   }
 }
 ```
+</details>
 
-### Windsurf
+<details>
+<summary><b>Windsurf</b> <i>(Click to expand)</i></summary>
 
 Add to `~/.codeium/windsurf/mcp_config.json`:
-
 ```json
 {
   "mcpServers": {
@@ -65,11 +84,12 @@ Add to `~/.codeium/windsurf/mcp_config.json`:
   }
 }
 ```
+</details>
 
-### VS Code
+<details>
+<summary><b>VS Code (GitHub Copilot) or Google Antigravity</b> <i>(Click to expand)</i></summary>
 
-Add to `.vscode/mcp.json` in your workspace (requires [GitHub Copilot](https://marketplace.visualstudio.com/items?itemName=GitHub.copilot)):
-
+Add to `.vscode/mcp.json` in your workspace:
 ```json
 {
   "servers": {
@@ -80,12 +100,13 @@ Add to `.vscode/mcp.json` in your workspace (requires [GitHub Copilot](https://m
   }
 }
 ```
+</details>
 
-That's it — start prompting. Try: *"Get the bounding box for Central Park in WKT format"*
+<br/>
 
-### Optional: enable location search
+> Try: *"Get the bounding box for Central Park in WKT format"*
 
-By default, you pass coordinates directly via the `bbox` parameter. To enable natural-language location search (e.g. *"San Francisco"*), add a [Mapbox access token](https://account.mapbox.com/access-tokens/):
+### Optional Configuration
 
 ```json
 {
@@ -94,46 +115,40 @@ By default, you pass coordinates directly via the `bbox` parameter. To enable na
       "command": "npx",
       "args": ["-y", "bbox-mcp-server"],
       "env": {
-        "MAPBOX_ACCESS_TOKEN": "pk.your-token-here"
+        "MAPBOX_ACCESS_TOKEN": "pk.your-token-here",
+        "OVERPASS_API_URL": "https://your.custom.overpass.instance/api/interpreter"
       }
     }
   }
 }
 ```
 
-### Other options
-
 | Variable | Default | Description |
 |---|---|---|
-| `MAX_H3_CELLS` | `50000` | Safety cap for H3 grid generation at high resolutions |
+| `MAPBOX_ACCESS_TOKEN` | — | Enables natural language location search (e.g. *"San Francisco"*) |
+| `OVERPASS_API_URL` | auto | Custom Overpass endpoint. By default, rotates between `overpass-api.de` and `kumi.systems`. |
+| `MAX_H3_CELLS` | `50000` | Safety cap for H3 grid generation |
 
-### Install globally (alternative to npx)
-
-```bash
-npm install -g bbox-mcp-server
-```
-
-Then use `"command": "bbox-mcp-server"` instead of the npx command in any of the configs above.
+*Or install globally: `npm install -g bbox-mcp-server`*
 
 ---
 
-## Tools
+## Tool Reference
 
 ### `get_bounds`
 
-Convert and project a bounding box across formats and coordinate systems.
+Convert and project a bounding box across 6 input formats, 9 output formats, and 3,900+ coordinate systems. Returns the center point and tile coordinates for the centroid.
 
-**Input** (one of `location` or `bbox` required):
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `bbox` | string | — | Input geometry (coordinates, WKT, GeoJSON, ogrinfo extent) |
+| `epsg` | string | `"4326"` | Target projection. Unknown codes auto-fetched from epsg.io. |
+| `format` | string | `"csv"` | Output: `csv`, `wkt`, `geojson-bbox`, `geojson-polygon`, `leaflet`, `overpass`, `ogc-bbox`, `kml`, `stac-bbox` |
+| `coord_order` | string | `"lng,lat"` | Swap to `"lat,lng"` for APIs that expect latitude first |
+| `zoom` | number | `15` | Zoom level for tile coordinate calculation |
+| `precision` | number | `6` | Decimal places in formatted output |
 
-| Param | Type | Description |
-|---|---|---|
-| `location` | string | Text search (e.g. `"San Francisco"`). Requires `MAPBOX_ACCESS_TOKEN`. |
-| `bbox` | string | Any parseable geometry — `"lat1,lng1,lat2,lng2"`, WKT, GeoJSON, or ogrinfo extent. |
-| `epsg` | string | Target EPSG code (default `"4326"`). Unknown codes auto-fetched from epsg.io. |
-| `format` | string | Output format: `csv`, `wkt`, `geojson-bbox`, `geojson-polygon`, `leaflet`, `overpass`, `ogc-bbox`, `kml`, `stac-bbox` |
-| `precision` | number | Decimal places (default `6`) |
-
-**Example prompt:** *"Get the bounding box for Central Park in WKT format projected to EPSG:32618"*
+**💡 Prompt:** *"Get the bounding box for Central Park in WKT format projected to EPSG:32618"*
 
 ---
 
@@ -141,78 +156,116 @@ Convert and project a bounding box across formats and coordinate systems.
 
 Generate Uber H3 hexagonal cell indices covering a bounding box.
 
-**Input** (one of `location` or `bbox` required):
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `bbox` | string | — | Input geometry |
+| `resolution` | number | — | H3 resolution (0–15) |
+| `compact` | boolean | `false` | Merge cells into coarser parents where possible |
+| `return_geometry` | boolean | `false` | Include GeoJSON hex boundaries |
+
+**💡 Prompt:** *"Give me H3 cells at resolution 7 for downtown Chicago, include the hex geometries"*
+
+---
+
+### `search_overpass`
+
+Execute an Overpass QL query within a bounding box. Returns structured results with names, coordinates, and tags.
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `bbox` | string | — | Input geometry |
+| `query` | string | — | Overpass QL (e.g. `nwr["amenity"="cafe"]`). The server wraps it in a bbox filter automatically. |
+| `limit` | number | `100` | Max elements returned |
+
+**💡 Prompt:** *"Search for nwr["amenity"="bench"] in Central Park, limit 50"*
+
+---
+
+### `list_osm_tags`
+
+Look up the correct OpenStreetMap tags for a category before writing an Overpass query.
 
 | Param | Type | Description |
 |---|---|---|
-| `location` | string | Text search. Requires `MAPBOX_ACCESS_TOKEN`. |
-| `bbox` | string | Any parseable geometry. |
-| `resolution` | number | **Required.** H3 resolution `0`–`15`. |
-| `compact` | boolean | Compact mixed-resolution output (default `false`) |
-| `return_geometry` | boolean | Include GeoJSON hex boundaries (default `false`) |
+| `category` | string | Broad category (e.g. `"food"`, `"health"`, `"transport"`) |
 
-**Example prompt:** *"Give me H3 cells at resolution 7 for downtown Chicago, include the hex geometries"*
+**💡 Prompt:** *"What are the correct OSM tags for supermarkets?"*
+
+---
+
+### `aggregate_overpass_h3`
+
+Run an Overpass query and bin results into H3 hexagons for spatial density analysis. Returns counts per cell and GeoJSON hex boundaries.
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `bbox` | string | — | Input geometry |
+| `query` | string | — | Overpass QL core query |
+| `resolution` | number | `8` | H3 resolution for binning |
+
+**💡 Prompt:** *"Aggregate all hospitals in Seattle into H3 bins at resolution 7"*
 
 ---
 
 ### `generate_share_url`
 
-Generate a shareable link to visualize a bounding box on the interactive map tool.
+Generate a shareable link to visualize a bounding box on the interactive map at vibhorsingh.com/boundingbox.
 
 | Param | Type | Description |
 |---|---|---|
-| `bbox` | string | **Required.** Any parseable geometry. |
+| `bbox` | string | Input geometry |
 
-**Example prompt:** *"Generate a share link for bbox 40.7128,-74.0060,40.7580,-73.9855"*
+**💡 Prompt:** *"Generate a share link for bbox 40.7128,-74.0060,40.7580,-73.9855"*
 
 ---
 
 ## Supported Input Formats
 
-All tools accept these formats through the `bbox` parameter:
+All tools auto-detect the input format. No need to specify which one you're using.
 
 | Format | Example |
 |---|---|
-| **Raw coordinates** | `40.7128,-74.0060,40.7580,-73.9855` |
-| **WKT** | `POLYGON((-74.006 40.712, -73.985 40.712, ...))` |
-| **GeoJSON** | `{"type":"Feature","geometry":{...}}` |
-| **GeoJSON bbox** | `{"bbox":[-74.006,40.712,-73.985,40.758]}` |
-| **ogrinfo extent** | `Extent: (-74.006, 40.712) - (-73.985, 40.758)` |
-| **Space-separated (GDAL)** | `40.7128 -74.0060 40.7580 -73.9855` |
+| Raw coordinates | `40.7128,-74.0060,40.7580,-73.9855` |
+| WKT | `POLYGON((-74.006 40.712, -73.985 40.712, ...))` |
+| GeoJSON | `{"type":"Feature","geometry":{...}}` |
+| GeoJSON bbox | `{"bbox":[-74.006,40.712,-73.985,40.758]}` |
+| ogrinfo extent | `Extent: (-74.006, 40.712) - (-73.985, 40.758)` |
+| Space-separated | `40.7128 -74.0060 40.7580 -73.9855` |
 
 ---
 
-## For AI Agent Developers
+## 🤖 For AI Agent Developers
 
-### What agents get back
+### Response structure
 
-Every tool response includes two content blocks:
+Every tool returns two content blocks:
 
-1. **Human-readable text** — formatted for display, includes the map link
-2. **Structured JSON** — machine-parseable with all computed data
+1. **Human-readable text** — formatted output with the map verification link
+2. **Structured JSON** — all computed data, machine-parseable
+
+Example `get_bounds` JSON response:
 
 ```json
 {
   "original_wgs84": { "lat1": 40.7128, "lng1": -74.006, "lat2": 40.758, "lng2": -73.9855 },
   "projected": { "xmin": -8238310.23, "ymin": 4970241.32, "xmax": -8235527.11, "ymax": 4976491.56 },
+  "center": { "lat": 40.7354, "lng": -73.99575 },
+  "tile_indices": { "z": 15, "x": 9660, "y": 12284 },
   "epsg": "3857",
+  "coord_order": "lng,lat",
   "area_km2": 8.681,
   "dimensions": { "width_km": 1.714, "height_km": 5.066 },
   "share_url": "https://vibhorsingh.com/boundingbox/#40.712800,-74.006000,40.758000,-73.985500"
 }
 ```
 
-### Verification pattern
-
-The `share_url` in every response opens the visual BBox Finder tool with the exact coordinates pre-loaded. Agents can present this link to users for visual confirmation.
-
 ### Error handling
 
-All errors return `isError: true` with a descriptive message. The server never crashes on bad input — invalid coordinates, unknown EPSG codes, and oversized H3 areas all return clean error responses.
+All errors return `isError: true` with a descriptive message. Invalid coordinates, unknown EPSG codes, and oversized H3 requests all return clean errors — the server never crashes on bad input.
 
 ### Logging
 
-Structured JSON logs are written to **stderr** (not stdout, which is reserved for the MCP protocol). Each log entry includes timestamp, level, and context data.
+Structured JSON logs go to **stderr** (stdout is reserved for MCP protocol). Each entry includes timestamp, level, and context.
 
 ---
 
