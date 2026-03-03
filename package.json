@@ -1,6 +1,7 @@
 {
     "name": "bbox-mcp-server",
-    "version": "1.2.1",
+    "mcpName": "io.github.iamvibhorsingh/bbox-mcp-server",
+    "version": "1.2.3",
     "description": "MCP server for bounding box coordinate conversion, EPSG projections, Uber H3 hexagonal indexing, Overpass OSM queries, and shareable map links",
     "type": "module",
     "license": "MIT",

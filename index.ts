@@ -16,7 +16,7 @@ import proj4defs from "./proj4defs.json" with { type: "json" };
 import { wktToGeoJSON as parseWKT } from "@terraformer/wkt";
 
 const SERVER_NAME = "bbox-mcp-server";
-const SERVER_VERSION = "1.2.1";
+const SERVER_VERSION = "1.2.3";
 
 const MAX_H3_CELLS = process.env.MAX_H3_CELLS ? parseInt(process.env.MAX_H3_CELLS, 10) : 50000;
 const MAPBOX_ACCESS_TOKEN = process.env.MAPBOX_ACCESS_TOKEN;
