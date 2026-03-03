@@ -16,7 +16,7 @@ import proj4defs from "./proj4defs.json" with { type: "json" };
 import { wktToGeoJSON as parseWKT } from "@terraformer/wkt";
 
 const SERVER_NAME = "bbox-mcp-server";
-const SERVER_VERSION = "1.2.3";
+const SERVER_VERSION = "1.2.4";
 
 const MAX_H3_CELLS = process.env.MAX_H3_CELLS ? parseInt(process.env.MAX_H3_CELLS, 10) : 50000;
 const MAPBOX_ACCESS_TOKEN = process.env.MAPBOX_ACCESS_TOKEN;
@@ -158,7 +158,7 @@ function parseBBox(input: string): BBox {
                 // Assuming format: (minX, minY) - (maxX, maxY) where X=lng, Y=lat
                 return ensureValidBBox(minCoords[1], minCoords[0], maxCoords[1], maxCoords[0]);
             }
-        } catch (e) { /* Fall through to next parser */ }
+        } catch (e: any) { log('info', 'parseBBox: ogrinfo extent parse failed, trying next parser', { error: e?.message }); }
     }
 
     // --- 2. GeoJSON Sniffer ---
@@ -177,7 +177,7 @@ function parseBBox(input: string): BBox {
             const lats = allCoords.map(c => c[1]);
             return ensureValidBBox(safeMin(lats), safeMin(lngs), safeMax(lats), safeMax(lngs));
         }
-    } catch (e) { /* Not valid JSON, fall through */ }
+    } catch (e: any) { log('info', 'parseBBox: GeoJSON parse failed, trying next parser', { error: e?.message }); }
 
     // --- 3. WKT Sniffer ---
     if (input.toUpperCase().includes("POLYGON") || input.toUpperCase().includes("POINT") || input.toUpperCase().includes("LINESTRING")) {
@@ -190,7 +190,7 @@ function parseBBox(input: string): BBox {
                 const lats = allCoords.map(c => c[1]);
                 return ensureValidBBox(safeMin(lats), safeMin(lngs), safeMax(lats), safeMax(lngs));
             }
-        } catch (e) { /* Full WKT parse failed */ }
+        } catch (e: any) { log('info', 'parseBBox: WKT parse failed, trying next parser', { error: e?.message }); }
     }
 
     // --- 4. Standard Coordinate Array Sniffer ---
