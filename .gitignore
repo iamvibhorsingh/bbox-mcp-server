@@ -3,3 +3,6 @@ dist/
 .mcp
 mcp
 server.json
+.mcpregistry_github_token
+.mcpregistry_registry_token
+mcp-publisher.exe
