@@ -4,8 +4,7 @@ The geospatial toolkit for AI agents. **6 tools, zero config** — give any LLM 
 
 Every response includes a verification link to **[vibhorsingh.com/boundingbox](https://vibhorsingh.com/boundingbox/)** so you can visually confirm results on an interactive map.
 
-[![Node.js](https://img.shields.io/badge/node-%3E%3D18-green)](https://nodejs.org/) [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE) [![MCP Badge](https://lobehub.com/badge/mcp-full/iamvibhorsingh-bbox-mcp-server)](https://lobehub.com/mcp/iamvibhorsingh-bbox-mcp-server)
-
+[![Node.js](https://img.shields.io/badge/node-%3E%3D18-green)](https://nodejs.org/) [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE) 
 ---
 
 ## Why This Exists
@@ -273,5 +272,6 @@ Structured JSON logs go to **stderr** (stdout is reserved for MCP protocol). Eac
 ---
 
 ## License
-
 MIT
+
+[![MCP Badge](https://lobehub.com/badge/mcp-full/iamvibhorsingh-bbox-mcp-server)](https://lobehub.com/mcp/iamvibhorsingh-bbox-mcp-server)
