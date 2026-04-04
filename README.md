@@ -26,7 +26,7 @@ Every response includes a verification link to **[vibhorsingh.com/boundingbox](h
 | `get_bounds` | Convert and project a bbox across formats and coordinate systems | `bbox`, `epsg`, `format`, `coord_order`, `zoom` |
 | `get_h3_indices` | Generate H3 hex cell indices covering a bbox | `bbox`, `resolution`, `compact` |
 | `generate_share_url` | Create a shareable map link for a bbox | `bbox` |
-| `search_overpass` | Query OpenStreetMap via Overpass QL | `bbox`, `query`, `limit` |
+| `search_overpass` | Query OpenStreetMap via Overpass QL within a bbox or radius | `bbox`, `query`, `limit`, `radius_meters` |
 | `list_osm_tags` | Look up correct OSM tags for a category | `category` |
 | `aggregate_overpass_h3` | Run an Overpass query and bin results into H3 hexagons | `bbox`, `query`, `resolution` |
 
@@ -169,15 +169,18 @@ Generate Uber H3 hexagonal cell indices covering a bounding box.
 
 ### `search_overpass`
 
-Execute an Overpass QL query within a bounding box. Returns structured results with names, coordinates, and tags.
+Execute an Overpass query within a bounding box or radius. Returns structured results with names, coordinates, and tags. The verification link plots each result as a pin on the map.
 
 | Param | Type | Default | Description |
 |---|---|---|---|
 | `bbox` | string | — | Input geometry |
-| `query` | string | — | Overpass QL (e.g. `nwr["amenity"="cafe"]`). The server wraps it in a bbox filter automatically. |
+| `query` | string | — | Overpass QL (e.g. `nwr["amenity"="cafe"]`). The server wraps it in the appropriate spatial filter automatically. |
+| `radius_meters` | number | — | Search radius in metres. Use only when the user specifies an explicit distance (e.g. `2000` for "within 2km"). Omit for area/region queries. |
 | `limit` | number | `100` | Max elements returned |
 
-**💡 Prompt:** *"Search for nwr["amenity"="bench"] in Central Park, limit 50"*
+**💡 Prompt:** *"Find all parking within 2km of JFK airport"*
+
+**💡 Prompt:** *"Search for hospitals in Manhattan, limit 50"*
 
 ---
 

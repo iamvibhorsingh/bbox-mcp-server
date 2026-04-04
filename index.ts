@@ -16,7 +16,7 @@ import proj4defs from "./proj4defs.json" with { type: "json" };
 import { wktToGeoJSON as parseWKT } from "@terraformer/wkt";
 
 const SERVER_NAME = "bbox-mcp-server";
-const SERVER_VERSION = "1.2.4";
+const SERVER_VERSION = "1.2.5";
 
 const MAX_H3_CELLS = process.env.MAX_H3_CELLS ? parseInt(process.env.MAX_H3_CELLS, 10) : 50000;
 const MAPBOX_ACCESS_TOKEN = process.env.MAPBOX_ACCESS_TOKEN;
@@ -370,6 +370,24 @@ function buildShareUrl(bbox: BBox): string {
     return `https://vibhorsingh.com/boundingbox/#${hash}`;
 }
 
+function buildShareUrlWithMarkers(
+    bbox: BBox,
+    elements: Array<{ coordinates: { lat: number; lon: number }; name: string }>
+): string {
+    const bboxPart = `${bbox.lat1.toFixed(6)},${bbox.lng1.toFixed(6)},${bbox.lat2.toFixed(6)},${bbox.lng2.toFixed(6)}`;
+    const MAX_MARKERS = 30;
+    const markerParts = elements
+        .filter(e => e.coordinates?.lat !== undefined && e.coordinates?.lon !== undefined)
+        .slice(0, MAX_MARKERS)
+        .map(e => {
+            let name = e.name || 'Point';
+            if (name.length > 30) name = name.slice(0, 27) + '...';
+            return `${e.coordinates.lat.toFixed(6)},${e.coordinates.lon.toFixed(6)},${encodeURIComponent(name)}`;
+        });
+    const hashParts = [bboxPart, ...markerParts];
+    return `https://vibhorsingh.com/boundingbox/#${hashParts.join('|')}`;
+}
+
 function getH3Cells(bbox: BBox, resolution: number, compact: boolean): string[] {
     if (resolution < 0 || resolution > 15 || !Number.isInteger(resolution)) {
         throw new Error(`Invalid H3 resolution: ${resolution}. Must be an integer between 0 and 15.`);
@@ -496,6 +514,52 @@ async function geocodeLocation(query: string): Promise<BBox> {
     }
 }
 
+async function geocodeLocationPoint(query: string): Promise<{ lat: number; lng: number }> {
+    if (!MAPBOX_ACCESS_TOKEN) {
+        throw new Error('Mapbox API token not configured. Set MAPBOX_ACCESS_TOKEN to use location search. Provide explicit coordinates via bbox instead.');
+    }
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    try {
+        const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(query)}.json?access_token=${MAPBOX_ACCESS_TOKEN}&limit=1`;
+        const response = await fetch(url, { signal: controller.signal });
+        if (!response.ok) throw new Error(`Geocoding failed: ${response.status} ${response.statusText}`);
+        const data = await response.json();
+        if (!data?.features?.length) throw new Error(`No results found for location: ${query}`);
+        const feature = data.features[0];
+        if (feature.center) {
+            return { lat: feature.center[1], lng: feature.center[0] };
+        } else if (feature.bbox) {
+            return { lat: (feature.bbox[1] + feature.bbox[3]) / 2, lng: (feature.bbox[0] + feature.bbox[2]) / 2 };
+        } else {
+            throw new Error(`Unable to determine center point for location: ${query}`);
+        }
+    } catch (err: any) {
+        if (err.name === 'AbortError') throw new Error(`Geocoding timed out after ${FETCH_TIMEOUT_MS / 1000}s for: ${query}`);
+        throw err;
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+function buildShareUrlCircleWithMarkers(
+    center: { lat: number; lng: number },
+    radiusMeters: number,
+    elements: Array<{ coordinates: { lat: number; lon: number }; name: string }>
+): string {
+    const circlePart = `C:${center.lat.toFixed(6)},${center.lng.toFixed(6)},${radiusMeters.toFixed(2)}`;
+    const MAX_MARKERS = 30;
+    const markerParts = elements
+        .filter(e => e.coordinates?.lat !== undefined && e.coordinates?.lon !== undefined)
+        .slice(0, MAX_MARKERS)
+        .map(e => {
+            let name = e.name || 'Point';
+            if (name.length > 30) name = name.slice(0, 27) + '...';
+            return `${e.coordinates.lat.toFixed(6)},${e.coordinates.lon.toFixed(6)},${encodeURIComponent(name)}`;
+        });
+    return `https://vibhorsingh.com/boundingbox/#${[circlePart, ...markerParts].join('|')}`;
+}
+
 // ---------------------------------------------------------------------------
 // Tool Handlers
 // ---------------------------------------------------------------------------
@@ -596,13 +660,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             {
                 name: "search_overpass",
-                description: "Execute an Overpass QL query to find POIs, roads, or other OSM features within a bounding box. You must provide the base query. The server automatically wraps it in a bbox filter and returns structured JSON.\n\nCOMMON TAG EXAMPLES:\n- Restaurants: `nwr[\"amenity\"=\"restaurant\"]`\n- Pizza: `nwr[\"amenity\"=\"fast_food\"][\"cuisine\"=\"pizza\"]`\n- Supermarkets: `nwr[\"shop\"=\"supermarket\"]`\n- Parks: `nwr[\"leisure\"=\"park\"]`\n- Hospitals: `nwr[\"amenity\"=\"hospital\"]`\n- Schools: `nwr[\"amenity\"=\"school\"]`\n- Parking: `nwr[\"amenity\"=\"parking\"]`\n- Highways/Roads: `way[\"highway\"]`",
+                description: "Execute an Overpass QL query to find POIs, roads, or other OSM features within a bounding box or radius. The server wraps your query in the appropriate spatial filter and returns structured JSON with a map link.\n\nSEARCH MODES:\n- Bounding box (default): searches a rectangular area. Use for region/area queries ('hospitals in Manhattan', 'parks in downtown Seattle').\n- Circle: searches within an exact radius. Use ONLY when the user specifies an explicit distance ('within 2km of JFK', '500 metres from the Eiffel Tower', '1 mile from Times Square'). Omit radius_meters for vague terms like 'near' or 'close to'.\n\nCOMMON TAG EXAMPLES:\n- Restaurants: `nwr[\"amenity\"=\"restaurant\"]`\n- Pizza: `nwr[\"amenity\"=\"fast_food\"][\"cuisine\"=\"pizza\"]`\n- Supermarkets: `nwr[\"shop\"=\"supermarket\"]`\n- Parks: `nwr[\"leisure\"=\"park\"]`\n- Hospitals: `nwr[\"amenity\"=\"hospital\"]`\n- Schools: `nwr[\"amenity\"=\"school\"]`\n- Parking: `nwr[\"amenity\"=\"parking\"]`\n- Highways/Roads: `way[\"highway\"]`",
                 inputSchema: {
                     type: "object",
                     properties: {
                         location: {
                             type: "string",
-                            description: "A text location to search for (e.g. 'San Francisco'). Requires MAPBOX_ACCESS_TOKEN env var. Either 'location' or 'bbox' MUST be provided."
+                            description: "A text location to search for (e.g. 'San Francisco', 'JFK Airport'). Requires MAPBOX_ACCESS_TOKEN env var. Either 'location' or 'bbox' MUST be provided."
                         },
                         bbox: {
                             type: "string",
@@ -610,11 +674,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         },
                         query: {
                             type: "string",
-                            description: "The Overpass QL core query. Example: `node[\"amenity\"=\"cafe\"]` or `nwr[\"leisure\"=\"park\"]`. DO NOT include the bounding box `(S,W,N,E)` or output format (`out json`), the server handles that automatically."
+                            description: "The Overpass QL core query. Example: `node[\"amenity\"=\"cafe\"]` or `nwr[\"leisure\"=\"park\"]`. DO NOT include spatial filters, bounding box, or output directives — the server handles those automatically."
+                        },
+                        radius_meters: {
+                            type: "number",
+                            description: "Search radius in metres. Enables circle mode — use ONLY when the user specifies an explicit distance (e.g. '2km' → 2000, '500 metres' → 500, '1 mile' → 1609). Omit entirely for area/region queries or vague terms like 'near'."
                         },
                         limit: {
                             type: "number",
-                            description: "Maximum number of elements to return. Helps prevent enormous JSON responses. Default is 100. Set to a higher number if you need more results."
+                            description: "Maximum number of elements to return. Default is 100. Increase if you need more results."
                         }
                     },
                     required: ["query"],
@@ -815,7 +883,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 content: [
                     {
                         type: "text",
-                        text: `H3 Cells Generated: ${cells.length.toLocaleString()}\nResolution: ${resolution}\nCompacted: ${compact}\n\nCells:\n${JSON.stringify(cells)}\n\nView original bounding box on map: ${shareUrl}`
+                        text: `H3 cells generated: ${cells.length.toLocaleString()}\nResolution: ${resolution} | Compacted: ${compact}\n\nCells:\n${JSON.stringify(cells)}\n\nView on map: ${shareUrl}`
                     },
                     {
                         type: "text",
@@ -842,7 +910,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 content: [
                     {
                         type: "text",
-                        text: `View on map: ${shareUrl}\nNote: you can paste this URL directly in your browser.`
+                        text: `View on map: ${shareUrl}`
                     },
                     {
                         type: "text",
@@ -859,60 +927,86 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const args = request.params.arguments || {};
             const queryRaw = args.query as string;
             const limit = args.limit as number || 100;
+            const radiusMeters = args.radius_meters as number | undefined;
+            const useCircle = typeof radiusMeters === 'number' && radiusMeters > 0;
 
             if (!queryRaw) {
                 return { content: [{ type: "text", text: "Error: 'query' is required (e.g. `node[\"amenity\"=\"restaurant\"]`)." }], isError: true };
             }
-
             if (queryRaw.length > 2000) {
                 return { content: [{ type: "text", text: "Error: Query is too long (maximum 2000 characters)." }], isError: true };
             }
-
             if (queryRaw.includes("[out:") || queryRaw.includes("[timeout:") || queryRaw.includes("[bbox:")) {
-                return { content: [{ type: "text", text: "Error: Query must not contain direct [out:], [timeout:], or [bbox:] directives. The server handles these automatically." }], isError: true };
+                return { content: [{ type: "text", text: "Error: Query must not contain [out:], [timeout:], or [bbox:] directives. The server handles these automatically." }], isError: true };
             }
 
-            let bboxObj: BBox;
-            if (args.location) {
-                try {
-                    bboxObj = await geocodeLocation(args.location as string);
-                } catch (err: any) {
-                    if (!args.bbox) {
-                        log('error', `Geocoding failed for overpass location: ${args.location}`, { error: err.message });
-                        return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
+            let overpassQuery: string;
+            let searchModeLabel: string;
+            let centerPoint: { lat: number; lng: number } | undefined;
+            let bboxObj: BBox | undefined;
+
+            if (useCircle) {
+                if (args.location) {
+                    try {
+                        centerPoint = await geocodeLocationPoint(args.location as string);
+                    } catch (err: any) {
+                        if (args.bbox) {
+                            log('warn', `Geocoding failed for radius search, using bbox center`, { error: err.message });
+                            const fb = parseBBox(args.bbox as string);
+                            centerPoint = { lat: (fb.lat1 + fb.lat2) / 2, lng: (fb.lng1 + fb.lng2) / 2 };
+                        } else {
+                            log('error', `Geocoding failed for radius search: ${args.location}`, { error: err.message });
+                            return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
+                        }
                     }
-                    bboxObj = parseBBox(args.bbox as string);
+                } else if (args.bbox) {
+                    const fb = parseBBox(args.bbox as string);
+                    centerPoint = { lat: (fb.lat1 + fb.lat2) / 2, lng: (fb.lng1 + fb.lng2) / 2 };
+                } else {
+                    return { content: [{ type: "text", text: "Error: Either 'location' or 'bbox' argument must be provided." }], isError: true };
                 }
-            } else if (args.bbox) {
-                bboxObj = parseBBox(args.bbox as string);
+                overpassQuery = `[out:json][timeout:25];\n(${queryRaw}(around:${radiusMeters},${centerPoint!.lat},${centerPoint!.lng}););\nout center;`;
+                searchModeLabel = `circle — ${radiusMeters}m radius around (${centerPoint!.lat.toFixed(5)}, ${centerPoint!.lng.toFixed(5)})`;
             } else {
-                return { content: [{ type: "text", text: "Error: Either 'location' or 'bbox' argument must be provided." }], isError: true };
+                if (args.location) {
+                    try {
+                        bboxObj = await geocodeLocation(args.location as string);
+                    } catch (err: any) {
+                        if (args.bbox) {
+                            log('warn', `Geocoding failed, falling back to bbox argument`, { error: err.message });
+                            bboxObj = parseBBox(args.bbox as string);
+                        } else {
+                            log('error', `Geocoding failed for overpass location: ${args.location}`, { error: err.message });
+                            return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
+                        }
+                    }
+                } else if (args.bbox) {
+                    bboxObj = parseBBox(args.bbox as string);
+                } else {
+                    return { content: [{ type: "text", text: "Error: Either 'location' or 'bbox' argument must be provided." }], isError: true };
+                }
+                overpassQuery = `[out:json][timeout:25][bbox:${bboxObj!.lat1},${bboxObj!.lng1},${bboxObj!.lat2},${bboxObj!.lng2}];\n(${queryRaw};);\nout center;`;
+                searchModeLabel = `bounding box`;
             }
 
-            log('info', `search_overpass starting`, { query: queryRaw });
-
-            const overpassQuery = `[out:json][timeout:25][bbox:${bboxObj.lat1},${bboxObj.lng1},${bboxObj.lat2},${bboxObj.lng2}];\n(${queryRaw};);\nout center;`;
+            log('info', `search_overpass starting`, { query: queryRaw, mode: useCircle ? 'circle' : 'bbox', radius_meters: radiusMeters });
 
             const endpoints = [
                 "https://overpass-api.de/api/interpreter",
                 "https://overpass.kumi.systems/api/interpreter"
             ];
-
             if (process.env.OVERPASS_API_URL) {
                 endpoints.unshift(process.env.OVERPASS_API_URL);
             }
 
             let data: any = null;
             let lastError: Error | null = null;
-
-            // Formatting payload precisely for Overpass
             const params = new URLSearchParams();
             params.append('data', overpassQuery);
 
             for (const endpoint of endpoints) {
                 const controller = new AbortController();
                 const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS * 2);
-
                 try {
                     log('info', `Executing Overpass query at ${endpoint}`);
                     const response = await fetch(endpoint, {
@@ -925,14 +1019,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         },
                         signal: controller.signal
                     });
-
                     if (!response.ok) {
                         throw new Error(`Overpass API returned status: ${response.status} ${response.statusText}`);
                     }
-
                     data = await response.json();
-                    break; // Success!
-
+                    break;
                 } catch (err: any) {
                     lastError = err;
                     log('warn', `Overpass API failed at ${endpoint}`, { error: err.message });
@@ -943,23 +1034,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
             if (!data) {
                 if (lastError?.name === 'AbortError') {
-                    return { content: [{ type: "text", text: `Error: Overpass API request timed out on all endpoints after ${(FETCH_TIMEOUT_MS * 4) / 1000}s overall. The query might be too broad.` }], isError: true };
+                    return { content: [{ type: "text", text: `Error: Overpass API request timed out on all endpoints after ${(FETCH_TIMEOUT_MS * 4) / 1000}s. The query or radius may be too large.` }], isError: true };
                 }
                 throw new Error(`Overpass query failed on all endpoints: ${lastError?.message}`);
             }
 
-            let rawElements = data.elements || [];
-
-            // Parse raw elements into structured output
             const seenIds = new Set();
-            let parsedElements = rawElements.reduce((acc: any[], e: any) => {
+            let parsedElements = (data.elements || []).reduce((acc: any[], e: any) => {
                 if (seenIds.has(e.id)) return acc;
                 seenIds.add(e.id);
-
                 const lat = e.lat ?? e.center?.lat;
                 const lon = e.lon ?? e.center?.lon;
-
-                // Only keep elements that actually have coordinates and tags (or allow untagged if requested, but structured output is better)
                 if (lat !== undefined && lon !== undefined) {
                     acc.push({
                         id: e.id,
@@ -974,32 +1059,41 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
             const elementCount = parsedElements.length;
             let truncated = false;
-
             if (parsedElements.length > limit) {
                 parsedElements = parsedElements.slice(0, limit);
                 truncated = true;
             }
 
-            const shareUrl = buildShareUrl(bboxObj);
+            const shareUrl = useCircle && centerPoint
+                ? buildShareUrlCircleWithMarkers(centerPoint, radiusMeters!, parsedElements)
+                : buildShareUrlWithMarkers(bboxObj!, parsedElements);
 
-            log('info', `search_overpass completed`, { elements: elementCount, returned: parsedElements.length, truncated });
+            log('info', `search_overpass completed`, { elements: elementCount, returned: parsedElements.length, truncated, mode: useCircle ? 'circle' : 'bbox' });
 
-            const responseData = {
+            const responseData: Record<string, unknown> = {
+                search_mode: useCircle ? 'circle' : 'bbox',
+                ...(useCircle && centerPoint
+                    ? { center: centerPoint, radius_meters: radiusMeters }
+                    : { original_bbox: bboxObj }),
                 generator: data.generator,
                 osm3s: data.osm3s,
                 elements: parsedElements,
                 total_count: elementCount,
                 returned_count: parsedElements.length,
                 truncated,
-                original_bbox: bboxObj,
                 share_url: shareUrl
             };
+
+            const topResults = parsedElements.slice(0, 5)
+                .map((e: any) => `- [${e.type}] ${e.name} (${e.coordinates.lat.toFixed(5)}, ${e.coordinates.lon.toFixed(5)})`)
+                .join('\n');
+            const moreNote = parsedElements.length > 5 ? `\n  … and ${parsedElements.length - 5} more (see JSON)` : '';
 
             return {
                 content: [
                     {
                         type: "text",
-                        text: `Successfully executed Overpass query.\nFound ${elementCount} elements${truncated ? ` (truncated to ${limit})` : ''}.\n\nSummary:\n${parsedElements.slice(0, 5).map((e: any) => `- [${e.type}] ${e.id} (${e.name})`).join('\n')}${parsedElements.length > 5 ? '\n... (see JSON for full results)' : ''}\n\nView original bounding box on map: ${shareUrl}`
+                        text: `Overpass query executed within a ${searchModeLabel}.\nFound ${elementCount} element${elementCount !== 1 ? 's' : ''}${truncated ? ` (showing first ${limit})` : ''}.\n\nTop results:\n${topResults}${moreNote}\n\nView on map: ${shareUrl}`
                     },
                     {
                         type: "text",
@@ -1189,7 +1283,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 content: [
                     {
                         type: "text",
-                        text: `Aggregated ${totalGrouped} elements into ${activeHexes.length} H3 hexagons at resolution ${resolution}.\n\nTop Hexagons by Density:\n${topHexes.map(([hex, count]) => `- Hex ${hex}: ${count} elements`).join('\n')}\n\nView bounding area on map: ${shareUrl}`
+                        text: `Aggregated ${totalGrouped} element${totalGrouped !== 1 ? 's' : ''} into ${activeHexes.length} H3 hexagon${activeHexes.length !== 1 ? 's' : ''} at resolution ${resolution}.\n\nTop hexagons by density:\n${topHexes.map(([hex, count]) => `- ${hex}: ${count} element${count !== 1 ? 's' : ''}`).join('\n')}\n\nView on map: ${shareUrl}`
                     },
                     {
                         type: "text",
