@@ -1,10 +1,42 @@
 # 🌍 bbox-mcp-server
 
-The geospatial toolkit for AI agents. **6 tools, zero config** — give any LLM the ability to parse, convert, query, and aggregate spatial data out of the box.
+**Ask AI about anything, anywhere — and verify the answer on a map. For Free**
 
-Every response includes a verification link to **[vibhorsingh.com/boundingbox](https://vibhorsingh.com/boundingbox/)** so you can visually confirm results on an interactive map.
+The geospatial toolkit for AI agents. **6 tools, zero config** — give any LLM the ability to find, query, convert, and aggregate spatial data using open data. No API keys or signups required to start.
 
-[![Node.js](https://img.shields.io/badge/node-%3E%3D18-green)](https://nodejs.org/) [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE) 
+Every response includes a shareable verification link to **[vibhorsingh.com/boundingbox](https://vibhorsingh.com/boundingbox/)** — click it to visually confirm results on an interactive map. No other MCP server does this.
+
+[![Node.js](https://img.shields.io/badge/node-%3E%3D18-green)](https://nodejs.org/) [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
+
+
+---
+
+## What Can You Do With This?
+
+**You don't have to be a GIS professional to make use of this.** Any AI agent with this MCP server can answer spatial questions using real OpenStreetMap data and not spit out hallucinated garbage.
+
+| Ask your AI agent... | What happens under the hood |
+|---|---|
+| *"How many EV chargers are in downtown Denver?"* | Overpass query → H3 hex binning → density analysis |
+| *"Is there a hospital near this Airbnb?"* | POI search with structured tags → map verification link |
+| *"Find all playgrounds within 1km of this address*"* | Overpass query + radius filter → pinned results on a shareable map |
+| *"Convert this WKT to GeoJSON in EPSG:3857"* | Format conversion across 6 inputs, 9 outputs, 3,900+ projections |
+| *"Show me all bike-share stations in Amsterdam"* | Curated OSM tags → Overpass query → results on map |
+| *"Compare park density across Seattle neighborhoods"* | Overpass + H3 aggregation → hex-binned spatial analysis |
+
+Every answer comes with a link. Click it, see if the AI got it right and you can also share it with someone else.
+
+---
+
+## What Makes This Different
+
+Most AI tools give you text you have to trust. This one gives you an interactive map you can check and verify!
+
+- **Verifiable** — Every response includes a public URL where you (or anyone) can visually confirm the results. This is the only MCP server that does this in any domain.
+- **Deterministic** — Queries hit real OpenStreetMap data and return real coordinates. The AI interprets your question. The data comes from all the hard work done by all the awesome OSM volunteers.
+- **Free** — No paid services. Overpass API is free, OSM data is free, the tool is free. A Mapbox token (free tier, no payment info) unlocks natural language location search but isn't required.
+- **Zero config** — `npx -y bbox-mcp-server` and you're running.
+
 ---
 
 ## Why This Exists
@@ -103,7 +135,7 @@ Add to `.vscode/mcp.json` in your workspace:
 
 <br/>
 
-> Try: *"Get the bounding box for Central Park in WKT format"*
+> Try: *"Find all coffee shops within 500m of Times Square"*
 
 ### Optional Configuration
 
@@ -261,6 +293,7 @@ Example `get_bounds` JSON response:
 }
 ```
 
+
 ### Error handling
 
 All errors return `isError: true` with a descriptive message. Invalid coordinates, unknown EPSG codes, and oversized H3 requests all return clean errors — the server never crashes on bad input.
@@ -270,7 +303,17 @@ All errors return `isError: true` with a descriptive message. Invalid coordinate
 Structured JSON logs go to **stderr** (stdout is reserved for MCP protocol). Each entry includes timestamp, level, and context.
 
 ---
+## Acknowledgments & Fair Use
 
+### OpenStreetMap
+
+This tool is built on [OpenStreetMap](https://www.openstreetmap.org/): A global dataset created and maintained by millions of volunteers. Every query you run returns data that someone walked, mapped, or verified by hand. If you find this useful, consider [contributing to OSM](https://wiki.openstreetmap.org/wiki/How_to_contribute).
+
+### Responsible Usage
+
+The public Overpass API instances are free community resources with limited capacity. Avoid tight loops, excessive polling, or bulk-scraping. For heavy workloads, set `OVERPASS_API_URL` to your own instance, see [Overpass API installation](https://wiki.openstreetmap.org/wiki/Overpass_API/Installation). The default server rotation helps spread load, but it's not a substitute for responsible usage.
+
+---
 ## License
 MIT
 
