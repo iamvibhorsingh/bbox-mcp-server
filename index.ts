@@ -683,6 +683,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         limit: {
                             type: "number",
                             description: "Maximum number of elements to return. Default is 100. Increase if you need more results."
+                        },
+                        return_geometry: {
+                            type: "boolean",
+                            description: "If true, returns the full geometry (polygon/polyline) for ways and relations instead of just the center point. Necessary for area or length calculations. Defaults to false."
                         }
                     },
                     required: ["query"],
@@ -928,6 +932,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const queryRaw = args.query as string;
             const limit = args.limit as number || 100;
             const radiusMeters = args.radius_meters as number | undefined;
+            const returnGeometry = args.return_geometry as boolean || false;
             const useCircle = typeof radiusMeters === 'number' && radiusMeters > 0;
 
             if (!queryRaw) {
@@ -965,7 +970,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 } else {
                     return { content: [{ type: "text", text: "Error: Either 'location' or 'bbox' argument must be provided." }], isError: true };
                 }
-                overpassQuery = `[out:json][timeout:25];\n(${queryRaw}(around:${radiusMeters},${centerPoint!.lat},${centerPoint!.lng}););\nout center;`;
+                const outDirective = returnGeometry ? "out geom;" : "out center;";
+                overpassQuery = `[out:json][timeout:25];\n(${queryRaw}(around:${radiusMeters},${centerPoint!.lat},${centerPoint!.lng}););\n${outDirective}`;
                 searchModeLabel = `circle — ${radiusMeters}m radius around (${centerPoint!.lat.toFixed(5)}, ${centerPoint!.lng.toFixed(5)})`;
             } else {
                 if (args.location) {
@@ -985,7 +991,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 } else {
                     return { content: [{ type: "text", text: "Error: Either 'location' or 'bbox' argument must be provided." }], isError: true };
                 }
-                overpassQuery = `[out:json][timeout:25][bbox:${bboxObj!.lat1},${bboxObj!.lng1},${bboxObj!.lat2},${bboxObj!.lng2}];\n(${queryRaw};);\nout center;`;
+                const outDirective = returnGeometry ? "out geom;" : "out center;";
+                overpassQuery = `[out:json][timeout:25][bbox:${bboxObj!.lat1},${bboxObj!.lng1},${bboxObj!.lat2},${bboxObj!.lng2}];\n(${queryRaw};);\n${outDirective}`;
                 searchModeLabel = `bounding box`;
             }
 
@@ -1043,16 +1050,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             let parsedElements = (data.elements || []).reduce((acc: any[], e: any) => {
                 if (seenIds.has(e.id)) return acc;
                 seenIds.add(e.id);
-                const lat = e.lat ?? e.center?.lat;
-                const lon = e.lon ?? e.center?.lon;
+                const lat = e.lat ?? e.center?.lat ?? e.geometry?.[0]?.lat;
+                const lon = e.lon ?? e.center?.lon ?? e.geometry?.[0]?.lon;
                 if (lat !== undefined && lon !== undefined) {
-                    acc.push({
+                    const el: any = {
                         id: e.id,
                         type: e.type,
                         name: e.tags?.name || "Unnamed",
                         coordinates: { lat, lon },
                         tags: e.tags || {}
-                    });
+                    };
+                    if (returnGeometry && e.geometry) {
+                        el.geometry = e.geometry;
+                    }
+                    acc.push(el);
                 }
                 return acc;
             }, []);

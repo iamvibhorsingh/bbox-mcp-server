@@ -1,0 +1,39 @@
+{
+  "manifest_version": "0.3",
+  "name": "bbox-mcp-server",
+  "display_name": "Bounding Box MCP Server",
+  "version": "1.3.0",
+  "description": "The geospatial toolkit for AI agents — query, convert, and verify spatial data with zero config.",
+  "author": {
+    "name": "Vibhor Singh"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/iamvibhorsingh/bbox-mcp-server"
+  },
+  "homepage": "https://vibhorsingh.com/boundingbox/",
+  "keywords": [
+    "mcp", "bounding-box", "spatial", "geocoding", "epsg", "h3", "wkt", "geojson", "openstreetmap"
+  ],
+  "license": "MIT",
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server/index.js"],
+      "env": {
+        "MAPBOX_ACCESS_TOKEN": "${user_config.mapbox_access_token}"
+      }
+    }
+  },
+  "user_config": {
+    "mapbox_access_token": {
+      "type": "string",
+      "title": "Mapbox Access Token",
+      "description": "Your Mapbox API token to enable text-based location searches (e.g. 'New York City'). Optional: If not provided, you must provide explicit coordinate bounding boxes instead.",
+      "sensitive": true,
+      "required": false
+    }
+  }
+}
