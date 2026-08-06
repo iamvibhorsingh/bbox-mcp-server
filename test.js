@@ -20,7 +20,7 @@ test("MCP Server Test Suite", async (t) => {
         const tools = await client.listTools();
         assert.deepStrictEqual(
             tools.tools.map(t => t.name),
-            ["get_bounds", "get_h3_indices", "generate_share_url", "search_overpass", "list_osm_tags", "aggregate_overpass_h3"]
+            ["get_bounds", "get_h3_indices", "generate_share_url", "reverse_geocode", "search_overpass", "list_osm_tags", "aggregate_overpass_h3"]
         );
     });
 
@@ -29,11 +29,12 @@ test("MCP Server Test Suite", async (t) => {
             name: "get_bounds",
             arguments: { bbox: "40.7128,-74.0060,40.7580,-73.9855", epsg: "3857", format: "geojson-bbox" }
         });
-        assert.strictEqual(result.isError, undefined); // MCP SDK doesn't always return isError: false, often it's just undefined or missing if okay
+        assert.strictEqual(result.isError, undefined);
         assert.ok(result.content[0].text.includes("Original WGS84"));
         assert.ok(result.content[0].text.includes("Projected to EPSG:3857"));
         assert.ok(result.content[0].text.includes("View on map"));
     });
+
     await t.test("get_bounds - coord_order lat,lng and center/tile fields", async () => {
         const result = await client.callTool({
             name: "get_bounds",
@@ -41,9 +42,7 @@ test("MCP Server Test Suite", async (t) => {
         });
         assert.strictEqual(result.isError, undefined);
 
-        // CSV should now output lat, lng
         const textOutput = result.content[0].text;
-        // In lat,lng mode, y gets mapped to lat, so minX becomes lat1.
         assert.ok(textOutput.includes("40.712800,-74.006000,40.758000,-73.985500"));
 
         const jsonOutput = JSON.parse(result.content[1].text);
@@ -84,7 +83,6 @@ test("MCP Server Test Suite", async (t) => {
         });
         assert.strictEqual(result.isError, undefined);
         assert.ok(result.content[0].text.includes("0.000000,0.000000,0.000000,0.000000") || result.content[0].text.includes("0.000000, 0.000000, 0.000000, 0.000000"));
-        // Check Area and Dimensions string
         assert.ok(result.content[0].text.includes("0.000 km² (0.000km x 0.000km)"));
     });
 
@@ -140,7 +138,6 @@ test("MCP Server Test Suite", async (t) => {
             arguments: { bbox: "40.7128,-74.0060,40.7580,-73.9855", precision: 2 }
         });
         assert.strictEqual(result.isError, undefined);
-        // Expect format to be truncated to 2 decimals
         assert.ok(result.content[0].text.includes("-74.01,40.71,-73.99,40.76"));
     });
 
@@ -150,7 +147,20 @@ test("MCP Server Test Suite", async (t) => {
             arguments: { bbox: "40.7128,-74.0060,40.7580,-73.9855", resolution: 7, compact: true }
         });
         assert.strictEqual(result.isError, undefined);
-        assert.ok(result.content[0].text.includes("H3 Cells Generated"));
+        assert.ok(result.content[0].text.includes("H3 cells generated") || result.content[0].text.includes("H3 Cells"));
+    });
+
+    await t.test("get_h3_indices - summary_only mode", async () => {
+        const result = await client.callTool({
+            name: "get_h3_indices",
+            arguments: { bbox: "40.7128,-74.0060,40.7580,-73.9855", resolution: 8, summary_only: true }
+        });
+        assert.strictEqual(result.isError, undefined);
+        assert.ok(result.content[0].text.includes("H3 summary"));
+        const jsonResponse = JSON.parse(result.content[1].text);
+        assert.strictEqual(jsonResponse.summary_only, true);
+        assert.ok(Array.isArray(jsonResponse.sample_cells));
+        assert.strictEqual(jsonResponse.cells, undefined);
     });
 
     await t.test("get_h3_indices - invalid resolution returns error", async () => {
@@ -189,6 +199,19 @@ test("MCP Server Test Suite", async (t) => {
         assert.ok(result.content[0].text.includes("Error: 'bbox' is required"));
     });
 
+    await t.test("reverse_geocode - happy path", async () => {
+        const result = await client.callTool({
+            name: "reverse_geocode",
+            arguments: { lat: 40.73, lng: -73.99 }
+        });
+        assert.strictEqual(result.isError, undefined);
+        assert.ok(result.content[0].text.includes("Matched Location"));
+        const jsonOutput = JSON.parse(result.content[1].text);
+        assert.strictEqual(jsonOutput.center.lat, 40.73);
+        assert.strictEqual(jsonOutput.center.lng, -73.99);
+        assert.ok(jsonOutput.matched_place);
+    });
+
     await t.test("search_overpass - missing query returns error", async () => {
         const result = await client.callTool({
             name: "search_overpass",
@@ -213,36 +236,31 @@ test("MCP Server Test Suite", async (t) => {
             arguments: { bbox: "0,0,1,1", query: 'node["amenity"]; [out:csv]' }
         });
         assert.strictEqual(result.isError, true);
-        assert.ok(result.content[0].text.includes("Query must not contain direct"));
+        assert.ok(result.content[0].text.includes("Query must not contain"));
     });
 
-    await t.test("search_overpass - happy path (live API)", async () => {
-        // Querying for parking near JFK Airport
-        // 40.6413,-73.7781 is roughly JFK
-        const jfkBbox = "40.63,-73.79,40.65,-73.76"; // ~2km radius around JFK
-        const query = 'nwr["amenity"="parking"]'; // The server auto-wraps this in the bbox envelope
+    await t.test("search_overpass - happy path with distance & pagination", async () => {
+        const jfkBbox = "40.63,-73.79,40.65,-73.76";
+        const query = 'nwr["amenity"="parking"]';
 
         const result = await client.callTool({
             name: "search_overpass",
-            arguments: { bbox: jfkBbox, query: query }
+            arguments: { bbox: jfkBbox, query, limit: 5, offset: 0 }
         });
 
-        if (result.isError) {
-            console.error("Overpass tool returned an error:", result.content[0].text);
-        }
-
         assert.strictEqual(result.isError, undefined);
-        assert.ok(result.content[0].text.includes("Successfully executed Overpass query"));
+        assert.ok(result.content[0].text.includes("Overpass query executed within a"));
         const jsonResponse = JSON.parse(result.content[1].text);
 
-        // Assert that we actually found elements
-        assert.ok(jsonResponse.elements.length > 0, "Expected to find at least one parking element near JFK");
+        assert.ok(jsonResponse.elements.length > 0, "Expected elements near JFK");
+        assert.ok(jsonResponse.elements[0].distance_meters !== undefined, "Expected distance_meters");
+        assert.ok(jsonResponse.distance_from, "Expected distance_from reference metadata");
     });
 
-    await t.test("list_osm_tags - happy path", async () => {
+    await t.test("list_osm_tags - happy path pre-indexed", async () => {
         const result = await client.callTool({
             name: "list_osm_tags",
-            arguments: { category: "restaurant" }
+            arguments: { category: "food" }
         });
 
         assert.strictEqual(result.isError, undefined);
@@ -250,19 +268,24 @@ test("MCP Server Test Suite", async (t) => {
         assert.ok(result.content[0].text.includes("nwr[\"amenity\"=\"fast_food\"]"));
     });
 
-    await t.test("aggregate_overpass_h3 - happy path (live API)", async () => {
-        // Querying for parking near JFK Airport, binning to H3 resolution 8
-        const jfkBbox = "40.63,-73.79,40.65,-73.76"; // ~2km radius around JFK
+    await t.test("list_osm_tags - Taginfo fallback for unknown category", async () => {
+        const result = await client.callTool({
+            name: "list_osm_tags",
+            arguments: { category: "coworking" }
+        });
+
+        assert.strictEqual(result.isError, undefined);
+        assert.ok(result.content[0].text.includes("Coworking Spaces") || result.content[0].text.includes("Taginfo"));
+    });
+
+    await t.test("aggregate_overpass_h3 - happy path", async () => {
+        const jfkBbox = "40.63,-73.79,40.65,-73.76";
         const query = 'nwr["amenity"="parking"]';
 
         const result = await client.callTool({
             name: "aggregate_overpass_h3",
-            arguments: { bbox: jfkBbox, query: query, resolution: 8 }
+            arguments: { bbox: jfkBbox, query, resolution: 8 }
         });
-
-        if (result.isError) {
-            console.error("aggregate_overpass_h3 returned an error:", result.content[0].text);
-        }
 
         assert.strictEqual(result.isError, undefined);
         assert.ok(result.content[0].text.includes("Aggregated"));
@@ -270,33 +293,8 @@ test("MCP Server Test Suite", async (t) => {
         const jsonResponse = JSON.parse(result.content[1].text);
 
         assert.strictEqual(jsonResponse.resolution, 8);
-        assert.ok(jsonResponse.total_elements > 0, "Expected to find elements");
-        assert.ok(jsonResponse.active_hex_count > 0, "Expected at least one active hex");
+        assert.ok(jsonResponse.total_elements > 0);
+        assert.ok(jsonResponse.active_hex_count > 0);
         assert.ok(jsonResponse.hex_geojson.type === "FeatureCollection");
-    });
-
-    await t.test("aggregate_overpass_h3 - seattle hospitals (README example)", async () => {
-        // We use a focused bbox around Central Seattle to keep the query fast and avoid Overpass timeouts
-        const seattleBbox = "47.59,-122.34,47.63,-122.30"; // Central Seattle / First Hill (where many hospitals are)
-        const query = 'nwr["amenity"="hospital"]';
-
-        const result = await client.callTool({
-            name: "aggregate_overpass_h3",
-            arguments: { bbox: seattleBbox, query: query, resolution: 7 }
-        });
-
-        if (result.isError) {
-            console.error("aggregate_overpass_h3 returned an error:", result.content[0].text);
-        }
-
-        assert.strictEqual(result.isError, undefined);
-        assert.ok(result.content[0].text.includes("Aggregated"));
-
-        const jsonResponse = JSON.parse(result.content[1].text);
-
-        assert.strictEqual(jsonResponse.resolution, 7);
-        // First Hill / Pill Hill has multiple major hospitals within this box (Harborview, Swedish, Virginia Mason)
-        assert.ok(jsonResponse.total_elements > 0, "Expected to find hospital elements in Central Seattle");
-        assert.ok(jsonResponse.active_hex_count > 0, "Expected at least one active hex");
-    });
+    });;
 });

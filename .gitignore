@@ -8,3 +8,8 @@ server.json
 mcp-publisher.exe
 *.mcpb
 mcpb-build/server/
+
+# Scratch & generated files
+*.geojson
+*.html
+*.cjs

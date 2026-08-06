@@ -147,7 +147,8 @@ Add to `.vscode/mcp.json` in your workspace:
       "args": ["-y", "bbox-mcp-server"],
       "env": {
         "MAPBOX_ACCESS_TOKEN": "pk.your-token-here",
-        "OVERPASS_API_URL": "https://your.custom.overpass.instance/api/interpreter"
+        "OVERPASS_API_URL": "https://your.custom.overpass.instance/api/interpreter",
+        "NOMINATIM_API_URL": "https://your.custom.nominatim.instance"
       }
     }
   }
@@ -158,6 +159,7 @@ Add to `.vscode/mcp.json` in your workspace:
 |---|---|---|
 | `MAPBOX_ACCESS_TOKEN` | — | Enables natural language location search (e.g. *"San Francisco"*) |
 | `OVERPASS_API_URL` | auto | Custom Overpass endpoint. By default, rotates between `overpass-api.de` and `kumi.systems`. |
+| `NOMINATIM_API_URL` | `https://nominatim.openstreetmap.org` | Custom Nominatim endpoint. Set this if hosting as a shared/remote MCP server or using a commercial provider. |
 | `MAX_H3_CELLS` | `50000` | Safety cap for H3 grid generation |
 
 *Or install globally: `npm install -g bbox-mcp-server`*
@@ -311,7 +313,7 @@ This tool is built on [OpenStreetMap](https://www.openstreetmap.org/): A global 
 
 ### Responsible Usage
 
-The public Overpass API instances are free community resources with limited capacity. Avoid tight loops, excessive polling, or bulk-scraping. For heavy workloads, set `OVERPASS_API_URL` to your own instance, see [Overpass API installation](https://wiki.openstreetmap.org/wiki/Overpass_API/Installation). The default server rotation helps spread load, but it's not a substitute for responsible usage.
+The public Overpass and Nominatim API instances are free community resources with limited capacity. Avoid tight loops, excessive polling, or bulk-scraping. If hosting this as a shared/remote MCP server, point `NOMINATIM_API_URL` and `OVERPASS_API_URL` at your own instance or a commercial provider (see [Overpass API installation](https://wiki.openstreetmap.org/wiki/Overpass_API/Installation) and [Nominatim installation](https://nominatim.org/release-docs/latest/admin/Installation/)). The default server rotation for Overpass helps spread load, but it's not a substitute for responsible usage.
 
 ---
 ## License
