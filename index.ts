@@ -141,11 +141,29 @@ function safeMax(arr: number[]): number {
 // Pure Functions Ported from bbox.js
 // ---------------------------------------------------------------------------
 
+const STRICT_NUM_RE = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i;
+
+function parseStrictNumber(raw: string): number {
+    const trimmed = raw.trim();
+    if (!STRICT_NUM_RE.test(trimmed)) return NaN;
+    const n = Number(trimmed);
+    return Number.isFinite(n) ? n : NaN;
+}
+
 function validateBBox(lat1: number, lng1: number, lat2: number, lng2: number): boolean {
     if (isNaN(lat1) || isNaN(lng1) || isNaN(lat2) || isNaN(lng2)) return false;
     if (lat1 < -90 || lat1 > 90 || lat2 < -90 || lat2 > 90) return false;
     if (lng1 < -180 || lng1 > 180 || lng2 < -180 || lng2 > 180) return false;
     return true;
+}
+
+function hasAntimeridianJump(coordsLngLat: number[][]): boolean {
+    for (let i = 1; i < coordsLngLat.length; i++) {
+        if (Math.abs(coordsLngLat[i][0] - coordsLngLat[i - 1][0]) > 180) {
+            return true;
+        }
+    }
+    return false;
 }
 
 function parseBBox(input: string, warnings?: string[]): BBox {
@@ -158,77 +176,149 @@ function parseBBox(input: string, warnings?: string[]): BBox {
         throw new Error(`Input too large (${(input.length / 1024).toFixed(0)} KB). Maximum allowed is ${(MAX_INPUT_LENGTH / 1024).toFixed(0)} KB.`);
     }
 
+    // --- 0. Web Mercator Tile Sniffer (z/x/y) ---
+    const tileMatch = input.trim().match(/^(\d{1,2})\s*\/\s*(\d+)\s*\/\s*(\d+)$/);
+    if (tileMatch) {
+        const z = parseInt(tileMatch[1], 10);
+        const x = parseInt(tileMatch[2], 10);
+        const y = parseInt(tileMatch[3], 10);
+        const maxTile = Math.pow(2, z);
+        if (z >= 0 && z <= 22 && x >= 0 && x < maxTile && y >= 0 && y < maxTile) {
+            return tileToBBox(z, x, y);
+        }
+        throw new Error(`Invalid Web Mercator tile coordinates: ${input}`);
+    }
+
     // --- 1. ogrinfo Extent Sniffer ---
     // Matches: "Extent: (-74.006000, 40.712800) - (-73.985500, 40.758000)"
     const ogrMatch = input.match(/Extent\:\s\((.*)\)/);
     if (ogrMatch && ogrMatch[1]) {
-        try {
-            const pairs = ogrMatch[1].split(") - (");
-            if (pairs.length === 2) {
-                const minCoords = pairs[0].replace('(', '').split(',').map(s => parseFloat(s.trim()));
-                const maxCoords = pairs[1].replace(')', '').split(',').map(s => parseFloat(s.trim()));
-
-                // Assuming format: (minX, minY) - (maxX, maxY) where X=lng, Y=lat
-                return ensureValidBBox(minCoords[1], minCoords[0], maxCoords[1], maxCoords[0]);
+        const pairs = ogrMatch[1].split(") - (");
+        if (pairs.length === 2) {
+            const minCoords = pairs[0].replace('(', '').split(',').map(parseStrictNumber);
+            const maxCoords = pairs[1].replace(')', '').split(',').map(parseStrictNumber);
+            if (minCoords.length !== 2 || maxCoords.length !== 2 || minCoords.some(isNaN) || maxCoords.some(isNaN)) {
+                throw new Error(`Invalid numeric values in ogrinfo extent: ${input}`);
             }
-        } catch (e: any) { log('info', 'parseBBox: ogrinfo extent parse failed, trying next parser', { error: e?.message }); }
+            if (minCoords[0] > maxCoords[0]) {
+                throw new Error(`Antimeridian (date-line) crossing bounding box detected (west=${minCoords[0]} > east=${maxCoords[0]}). Split the region at ±180° longitude.`);
+            }
+            // Format: (minX, minY) - (maxX, maxY) where X=lng, Y=lat
+            return ensureValidBBox(minCoords[1], minCoords[0], maxCoords[1], maxCoords[0]);
+        }
     }
 
     // --- 2. GeoJSON Sniffer ---
-    try {
-        const json = JSON.parse(input);
-        if (json.bbox && json.bbox.length === 4) {
-            // standard GeoJSON bbox: [minX, minY, maxX, maxY]
-            return ensureValidBBox(json.bbox[1], json.bbox[0], json.bbox[3], json.bbox[2]);
+    if (input.trim().startsWith('{')) {
+        let json: any;
+        try {
+            json = JSON.parse(input);
+        } catch (e: any) {
+            throw new Error(`Invalid GeoJSON input: ${e?.message}`);
+        }
+        if (json.bbox && Array.isArray(json.bbox) && json.bbox.length === 4) {
+            const [west, south, east, north] = json.bbox.map((v: any) => typeof v === 'number' ? v : parseStrictNumber(String(v)));
+            if ([west, south, east, north].some(isNaN)) {
+                throw new Error(`Invalid numeric values in GeoJSON bbox.`);
+            }
+            if (west > east) {
+                throw new Error(`Antimeridian (date-line) crossing GeoJSON bbox detected (west=${west} > east=${east}). Split the bounding box at ±180° longitude.`);
+            }
+            if (south > north) {
+                throw new Error(`Invalid GeoJSON bbox: south (${south}) > north (${north}).`);
+            }
+            return ensureValidBBox(south, west, north, east);
         }
 
-        // Multi-Geometry Coordinate Extraction (using shared, stack-safe utility)
         const allCoords = extractCoords(json);
-
         if (allCoords.length > 0) {
+            if (hasAntimeridianJump(allCoords)) {
+                throw new Error(`Antimeridian (date-line) crossing geometry detected (longitude jump > 180°). Split the geometry at ±180° longitude.`);
+            }
             const lngs = allCoords.map(c => c[0]);
             const lats = allCoords.map(c => c[1]);
             return ensureValidBBox(safeMin(lats), safeMin(lngs), safeMax(lats), safeMax(lngs));
         }
-    } catch (e: any) { log('info', 'parseBBox: GeoJSON parse failed, trying next parser', { error: e?.message }); }
+        throw new Error(`GeoJSON input contains no valid coordinates or bbox.`);
+    }
 
     // --- 3. WKT Sniffer ---
-    if (input.toUpperCase().includes("POLYGON") || input.toUpperCase().includes("POINT") || input.toUpperCase().includes("LINESTRING")) {
+    if (/^\s*(MULTI)?(POLYGON|POINT|LINESTRING)|^\s*GEOMETRYCOLLECTION/i.test(input)) {
+        let geojson: any;
         try {
-            const geojson = parseWKT(input) as any;
-            const allCoords = extractCoords(geojson.coordinates || geojson);
-
-            if (allCoords.length > 0) {
-                const lngs = allCoords.map(c => c[0]);
-                const lats = allCoords.map(c => c[1]);
-                return ensureValidBBox(safeMin(lats), safeMin(lngs), safeMax(lats), safeMax(lngs));
+            geojson = parseWKT(input) as any;
+        } catch (e: any) {
+            throw new Error(`Failed to parse WKT geometry: ${e?.message}`);
+        }
+        const allCoords = extractCoords(geojson?.coordinates ? geojson : { geometry: geojson });
+        if (allCoords.length > 0) {
+            if (hasAntimeridianJump(allCoords)) {
+                throw new Error(`Antimeridian (date-line) crossing WKT geometry detected (longitude jump > 180°). Split the geometry at ±180° longitude.`);
             }
-        } catch (e: any) { log('info', 'parseBBox: WKT parse failed, trying next parser', { error: e?.message }); }
+            const lngs = allCoords.map(c => c[0]);
+            const lats = allCoords.map(c => c[1]);
+            return ensureValidBBox(safeMin(lats), safeMin(lngs), safeMax(lats), safeMax(lngs));
+        }
+        throw new Error(`Failed to extract coordinates from WKT geometry.`);
     }
 
-    // --- 4. Standard Coordinate Array Sniffer ---
-    // Strip brackets/parentheses and split by commas or spaces
-    const cleanInput = input.replace(/[\[\]\(\)]/g, '').trim();
-    // Support space-separated (GDAL) or comma-separated
-    const parts = cleanInput.split(/[\s,]+/).map(s => parseFloat(s.trim())).filter(n => !isNaN(n));
+    // --- 4. Strict Coordinate Array Sniffer ---
+    const trimmed = input.trim();
+    // Reject strings containing unexpected characters outside brackets, parens, commas, whitespace, digits, signs, decimal point, exponent
+    if (!/^[\[\(\s]*[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?(?:\s*[\s,]\s*[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)*[\]\)\s]*$/i.test(trimmed)) {
+        throw new Error(`Failed to parse bounding box: contains invalid coordinate tokens. Input must be valid WKT, GeoJSON, ogrinfo extent, tile "z/x/y", point "lat,lng", or "lat1,lng1,lat2,lng2". Got: ${input.substring(0, 50)}`);
+    }
+
+    const cleanInput = trimmed.replace(/^[\[\(\s]+|[\]\)\s]+$/g, '');
+    const rawTokens = cleanInput.split(/[\s,]+/).filter(Boolean);
+    const parts = rawTokens.map(parseStrictNumber);
+
+    if (parts.some(isNaN)) {
+        throw new Error(`Failed to parse bounding box: invalid numeric token in "${input.substring(0, 50)}".`);
+    }
+
+    if (parts.length === 2) {
+        const p0 = parts[0], p1 = parts[1];
+        if (validateBBox(p0, p1, p0, p1)) {
+            return ensureValidBBox(p0, p1, p0, p1);
+        } else if (validateBBox(p1, p0, p1, p0)) {
+            warnings?.push(`Detected single point in lng,lat order (${p0}, ${p1}); auto-converted to lat=${p1}, lng=${p0}.`);
+            return ensureValidBBox(p1, p0, p1, p0);
+        }
+        throw new Error(`Invalid point coordinates: (${p0}, ${p1}). Latitude must be [-90, 90] and longitude [-180, 180].`);
+    }
 
     if (parts.length === 4) {
-        // Default interpretation: lat1, lng1, lat2, lng2
-        // Detect ambiguity: if both (lat,lng) and (lng,lat) orderings are valid,
-        // the caller may have a transposed box without knowing it.
         const asLatLng = validateBBox(parts[0], parts[1], parts[2], parts[3]);
         const asLngLat = validateBBox(parts[1], parts[0], parts[3], parts[2]);
-        if (asLatLng && asLngLat && (parts[0] !== parts[1] || parts[2] !== parts[3])) {
+        if (!asLatLng && asLngLat) {
+            // Check antimeridian crossing in lng,lat,lng,lat order: parts[0] = west, parts[2] = east
+            if (parts[0] > parts[2] && (parts[0] - parts[2]) > 180) {
+                throw new Error(`Antimeridian (date-line) crossing bounding box detected (west=${parts[0]} > east=${parts[2]}). Split the bounding box at ±180° longitude.`);
+            }
             warnings?.push(
-                `Ambiguous coordinate order: interpreted as lat,lng,lat,lng → (${parts[0]}, ${parts[1]}, ${parts[2]}, ${parts[3]}). ` +
-                `If your source uses lng,lat order (GeoJSON, GDAL, most GIS tools), the bounding box may be transposed. ` +
-                `Use GeoJSON or WKT input to avoid ambiguity.`
+                `Detected lng,lat,lng,lat coordinate order (${parts[0]}, ${parts[1]}, ${parts[2]}, ${parts[3]}) because longitude is outside [-90, 90]. Automatically transposed to lat,lng.`
             );
+            return ensureValidBBox(parts[1], parts[0], parts[3], parts[2]);
         }
-        return ensureValidBBox(parts[0], parts[1], parts[2], parts[3]);
+        if (asLatLng) {
+            // Check antimeridian crossing in lat1,lng1,lat2,lng2 order: parts[1] = west, parts[3] = east
+            if (parts[1] > parts[3] && (parts[1] - parts[3]) > 180) {
+                throw new Error(`Antimeridian (date-line) crossing bounding box detected (west=${parts[1]} > east=${parts[3]}). Split the bounding box at ±180° longitude.`);
+            }
+            if (asLngLat && (parts[0] !== parts[1] || parts[2] !== parts[3])) {
+                warnings?.push(
+                    `Ambiguous coordinate order: interpreted as lat,lng,lat,lng → (${parts[0]}, ${parts[1]}, ${parts[2]}, ${parts[3]}). ` +
+                    `If your source uses lng,lat order (GeoJSON, GDAL, most GIS tools), the bounding box may be transposed. ` +
+                    `Use GeoJSON or WKT input to avoid ambiguity.`
+                );
+            }
+            return ensureValidBBox(parts[0], parts[1], parts[2], parts[3]);
+        }
+        throw new Error(`Invalid coordinates or out of bounds: lat[-90, 90], lng[-180, 180]. Provided: ${parts.join(', ')}`);
     }
 
-    throw new Error(`Failed to parse bounding box. Input must be one of: WKT, GeoJSON, ogrinfo extent, or "lat1,lng1,lat2,lng2" string. Got: ${input.substring(0, 50)}...`);
+    throw new Error(`Failed to parse bounding box. Expected 2 (point) or 4 (bbox) numbers, WKT, GeoJSON, ogrinfo extent, or tile "z/x/y". Got ${parts.length} numbers in: ${input.substring(0, 50)}`);
 }
 
 function ensureValidBBox(lat1: number, lng1: number, lat2: number, lng2: number): BBox {
@@ -405,18 +495,84 @@ function latLngToTile(lat: number, lng: number, zoom: number): { z: number, x: n
     return { z: zoom, x, y };
 }
 
-function buildShareUrl(bbox: BBox): string {
-    const hash = `${bbox.lat1.toFixed(6)},${bbox.lng1.toFixed(6)},${bbox.lat2.toFixed(6)},${bbox.lng2.toFixed(6)}`;
-    return `https://vibhorsingh.com/boundingbox/#${hash}`;
+function tileToBBox(z: number, x: number, y: number): BBox {
+    const n = Math.pow(2, z);
+    const lng1 = (x / n) * 360 - 180;
+    const lng2 = ((x + 1) / n) * 360 - 180;
+    const latRad1 = Math.atan(Math.sinh(Math.PI * (1 - (2 * (y + 1)) / n)));
+    const latRad2 = Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / n)));
+    const lat1 = (latRad1 * 180) / Math.PI;
+    const lat2 = (latRad2 * 180) / Math.PI;
+    return ensureValidBBox(lat1, lng1, lat2, lng2);
 }
 
-function buildShareUrlWithMarkers(
-    bbox: BBox,
+function expandBBoxMeters(bbox: BBox, bufferMeters: number): BBox {
+    if (!bufferMeters || bufferMeters === 0) return bbox;
+    const midLat = ((bbox.lat1 + bbox.lat2) / 2) * (Math.PI / 180);
+    const dLat = bufferMeters / 111320;
+    const cosLat = Math.max(0.01, Math.cos(midLat));
+    const dLng = bufferMeters / (111320 * cosLat);
+    return ensureValidBBox(
+        Math.max(-90, bbox.lat1 - dLat),
+        Math.max(-180, bbox.lng1 - dLng),
+        Math.min(90, bbox.lat2 + dLat),
+        Math.min(180, bbox.lng2 + dLng)
+    );
+}
+
+/**
+ * Extracts polygons (with interior holes preserved) as arrays of [lat, lng] rings
+ * for H3 polygonToCells and point-in-polygon checks.
+ * Return shape: number[][][][] = Array of Polygons, where each Polygon is [outerRing, ...holeRings],
+ * and each Ring is Array of [lat, lng].
+ */
+function extractPolygonsWithHolesLatLng(input: any): number[][][][] | null {
+    try {
+        let geom = input;
+        if (typeof input === 'string') {
+            const trimmed = input.trim();
+            if (trimmed.startsWith('{')) {
+                geom = JSON.parse(trimmed);
+            } else if (/^\s*(MULTI)?POLYGON/i.test(trimmed)) {
+                geom = parseWKT(trimmed);
+            } else {
+                return null;
+            }
+        }
+        if (!geom || typeof geom !== 'object') return null;
+        if (geom.type === 'Feature') geom = geom.geometry;
+        if (geom.type === 'FeatureCollection' && Array.isArray(geom.features) && geom.features.length > 0) {
+            const polys: number[][][][] = [];
+            for (const f of geom.features) {
+                const sub = extractPolygonsWithHolesLatLng(f.geometry);
+                if (sub) polys.push(...sub);
+            }
+            return polys.length > 0 ? polys : null;
+        }
+        if (!geom) return null;
+        if (geom.type === 'Polygon' && Array.isArray(geom.coordinates) && geom.coordinates.length > 0) {
+            // Preserve outer ring AND all interior hole rings, converting [lng, lat] -> [lat, lng]
+            const ringsLatLng: number[][][] = geom.coordinates.map((ring: number[][]) =>
+                ring.map((c: number[]) => [c[1], c[0]])
+            );
+            return [ringsLatLng];
+        }
+        if (geom.type === 'MultiPolygon' && Array.isArray(geom.coordinates) && geom.coordinates.length > 0) {
+            return geom.coordinates.map((poly: number[][][]) =>
+                poly.map((ring: number[][]) => ring.map((c: number[]) => [c[1], c[0]]))
+            );
+        }
+    } catch {
+        // Ignore and fall back to bounding box
+    }
+    return null;
+}
+
+function formatMarkerParts(
     elements: Array<{ coordinates: { lat: number; lon: number }; name: string }>
-): string {
-    const bboxPart = `${bbox.lat1.toFixed(6)},${bbox.lng1.toFixed(6)},${bbox.lat2.toFixed(6)},${bbox.lng2.toFixed(6)}`;
+): string[] {
     const MAX_MARKERS = 30;
-    const markerParts = elements
+    return elements
         .filter(e => e.coordinates?.lat !== undefined && e.coordinates?.lon !== undefined)
         .slice(0, MAX_MARKERS)
         .map(e => {
@@ -424,11 +580,101 @@ function buildShareUrlWithMarkers(
             if (name.length > 30) name = name.slice(0, 27) + '...';
             return `${e.coordinates.lat.toFixed(6)},${e.coordinates.lon.toFixed(6)},${encodeURIComponent(name)}`;
         });
-    const hashParts = [bboxPart, ...markerParts];
+}
+
+function buildShareUrl(bbox: BBox): string {
+    const hash = `${bbox.lat1.toFixed(6)},${bbox.lng1.toFixed(6)},${bbox.lat2.toFixed(6)},${bbox.lng2.toFixed(6)}`;
+    return `https://vibhorsingh.com/boundingbox/#${hash}`;
+}
+
+function buildShareUrlWithMarkers(
+    bbox: BBox,
+    elements: Array<{ coordinates: { lat: number; lon: number }; name: string }>,
+    extraParts?: string[]
+): string {
+    const bboxPart = `${bbox.lat1.toFixed(6)},${bbox.lng1.toFixed(6)},${bbox.lat2.toFixed(6)},${bbox.lng2.toFixed(6)}`;
+    const markerParts = formatMarkerParts(elements);
+    const hashParts = [bboxPart, ...(extraParts || []), ...markerParts];
     return `https://vibhorsingh.com/boundingbox/#${hashParts.join('|')}`;
 }
 
-function getH3Cells(bbox: BBox, resolution: number, compact: boolean): string[] {
+/**
+ * Builds a verification map URL without an active orange bounding-box rectangle (empty parts[0]).
+ * The viewer renders any PB: polylines/polygons and markers, and auto-fits the map bounds to them.
+ */
+function buildShareUrlMarkersOnly(
+    elements: Array<{ coordinates: { lat: number; lon: number }; name: string }>,
+    extraParts?: string[]
+): string {
+    const markerParts = formatMarkerParts(elements);
+    const hashParts = ["", ...(extraParts || []), ...markerParts];
+    return `https://vibhorsingh.com/boundingbox/#${hashParts.join('|')}`;
+}
+
+/**
+ * Builds a verification map URL with a polygon boundary (P:lat,lng,...) in parts[0] instead of a rectangle.
+ */
+function buildShareUrlPolygon(
+    outerRingLatLng: number[][],
+    elements: Array<{ coordinates: { lat: number; lon: number }; name: string }> = []
+): string {
+    const MAX_RING_PTS = 60;
+    let sampled = outerRingLatLng;
+    if (outerRingLatLng.length > MAX_RING_PTS) {
+        sampled = [];
+        for (let i = 0; i < MAX_RING_PTS; i++) {
+            const idx = Math.min(
+                outerRingLatLng.length - 1,
+                Math.round((i / (MAX_RING_PTS - 1)) * (outerRingLatLng.length - 1))
+            );
+            sampled.push(outerRingLatLng[idx]);
+        }
+    }
+    const polyPart = `P:${sampled.map(([lat, lng]) => `${lat.toFixed(5)},${lng.toFixed(5)}`).join(',')}`;
+    const markerParts = formatMarkerParts(elements);
+    return `https://vibhorsingh.com/boundingbox/#${[polyPart, ...markerParts].join('|')}`;
+}
+
+/**
+ * Encodes a route LineString ([lng, lat][]) onto the verification map URL using the viewer's
+ * PB: layer format (tracing forward and backward so Leaflet renders the exact path line)
+ * alongside origin/destination markers, WITHOUT drawing an unnecessary bounding box rectangle.
+ */
+function buildShareUrlWithRoute(
+    _bbox: BBox,
+    routeCoordsLngLat: number[][],
+    markers: Array<{ coordinates: { lat: number; lon: number }; name: string }>
+): string {
+    const MAX_PATH_PTS = 45;
+    let sampled = routeCoordsLngLat;
+    if (routeCoordsLngLat.length > MAX_PATH_PTS) {
+        sampled = [];
+        for (let i = 0; i < MAX_PATH_PTS; i++) {
+            const idx = Math.min(
+                routeCoordsLngLat.length - 1,
+                Math.round((i / (MAX_PATH_PTS - 1)) * (routeCoordsLngLat.length - 1))
+            );
+            sampled.push(routeCoordsLngLat[idx]);
+        }
+    }
+    const extraParts: string[] = [];
+    if (sampled.length >= 2) {
+        // Trace forward then backward so L.Polygon renders a zero-area polyline trace on the viewer
+        const forward = sampled.map(([lng, lat]) => `${lat.toFixed(5)},${lng.toFixed(5)}`);
+        const backward = sampled
+            .slice(1, -1)
+            .reverse()
+            .map(([lng, lat]) => `${lat.toFixed(5)},${lng.toFixed(5)}`);
+        const allPts = [...forward, ...backward];
+        if (allPts.length < 3 && sampled.length === 2) {
+            allPts.push(forward[0]);
+        }
+        extraParts.push(`PB:${allPts.join(',')}`);
+    }
+    return buildShareUrlMarkersOnly(markers, extraParts);
+}
+
+function getH3Cells(bbox: BBox, resolution: number, compact: boolean, customPolygons?: number[][][][] | null): string[] {
     if (resolution < 0 || resolution > 15 || !Number.isInteger(resolution)) {
         throw new Error(`Invalid H3 resolution: ${resolution}. Must be an integer between 0 and 15.`);
     }
@@ -446,16 +692,31 @@ function getH3Cells(bbox: BBox, resolution: number, compact: boolean): string[] 
         throw new Error(`Area too large for resolution ${resolution}. Estimated ${Math.floor(estimatedCount).toLocaleString()} cells. Maximum allowed is ${MAX_H3_CELLS.toLocaleString()}.`);
     }
 
-    // H3 v4 polygon format: [ [lat, lng]... ]
-    const polygon = [
-        [bbox.lat1, bbox.lng1],
-        [bbox.lat2, bbox.lng1],
-        [bbox.lat2, bbox.lng2],
-        [bbox.lat1, bbox.lng2],
-        [bbox.lat1, bbox.lng1]
-    ];
+    let cells: string[] = [];
+    if (customPolygons && customPolygons.length > 0) {
+        const cellSet = new Set<string>();
+        for (const polyWithHoles of customPolygons) {
+            if (polyWithHoles.length > 0 && polyWithHoles[0].length >= 3) {
+                // Pass full [outerRing, ...holeRings] to h3.polygonToCells so holes are excluded
+                for (const c of h3.polygonToCells(polyWithHoles, resolution)) {
+                    cellSet.add(c);
+                }
+            }
+        }
+        cells = Array.from(cellSet);
+    }
 
-    let cells = h3.polygonToCells(polygon, resolution);
+    if (cells.length === 0 && (!customPolygons || customPolygons.length === 0)) {
+        // Fallback to rectangular bbox polygon: [ [lat, lng]... ]
+        const polygon = [
+            [bbox.lat1, bbox.lng1],
+            [bbox.lat2, bbox.lng1],
+            [bbox.lat2, bbox.lng2],
+            [bbox.lat1, bbox.lng2],
+            [bbox.lat1, bbox.lng1]
+        ];
+        cells = h3.polygonToCells(polygon, resolution);
+    }
 
     if (cells.length > MAX_H3_CELLS) {
         throw new Error(`Too many cells generated (${cells.length.toLocaleString()}). Maximum allowed is ${MAX_H3_CELLS.toLocaleString()}. Try a lower resolution or smaller bounds.`);
@@ -498,26 +759,74 @@ function h3CellsToGeoJSON(cells: string[]): object {
 }
 
 // ---------------------------------------------------------------------------
-// Nominatim Rate Limiter, Caching, and Utilities
+// Concurrency-Safe Rate Limiter, Provenance Metadata, and Caches
 // ---------------------------------------------------------------------------
 
-let lastNominatimRequestTime = 0;
+export interface ProvenanceMetadata {
+    provider: string;
+    attribution?: string;
+    data_timestamp: string;
+    cached: boolean;
+    cache_age_ms: number;
+    usage_policy?: string;
+}
+
+const OSM_ATTRIBUTION = "© OpenStreetMap contributors (ODbL - https://www.openstreetmap.org/copyright)";
+const APP_USER_AGENT = process.env.OSM_USER_AGENT || `${SERVER_NAME}/${SERVER_VERSION} (https://github.com/iamvibhorsingh/bbox-mcp-server)`;
+
+/**
+ * Creates a concurrency-safe rate limiter using a serialized promise queue.
+ * Concurrent callers are strictly spaced by at least `minIntervalMs`.
+ */
+function createRateLimiter(minIntervalMs: number): () => Promise<void> {
+    let nextAllowedTime = 0;
+    let queue: Promise<void> = Promise.resolve();
+    return () => {
+        const run = queue.then(async () => {
+            const now = Date.now();
+            const waitMs = Math.max(0, nextAllowedTime - now);
+            nextAllowedTime = Math.max(now, nextAllowedTime) + minIntervalMs;
+            if (waitMs > 0) {
+                await new Promise(resolve => setTimeout(resolve, waitMs));
+            }
+        });
+        queue = run.catch(() => {});
+        return run;
+    };
+}
+
+const nominatimRateLimit = createRateLimiter(1000);
+const photonRateLimit = createRateLimiter(1000);
+const routingRateLimit = createRateLimiter(1000);
+
 const NOMINATIM_CACHE = new Map<string, { timestamp: number; data: any }>();
 const NOMINATIM_TTL_MS = 60 * 60 * 1000; // 1 hour TTL
 const NOMINATIM_BASE_URL = (process.env.NOMINATIM_API_URL || "https://nominatim.openstreetmap.org").replace(/\/+$/, "");
+const PHOTON_BASE_URL = (process.env.PHOTON_API_URL || "https://photon.komoot.io").replace(/\/+$/, "");
 
-async function fetchNominatim(url: string): Promise<any> {
+async function fetchNominatim(url: string): Promise<{ data: any; cached: boolean; cache_age_ms: number; timestamp: string }> {
     const cached = NOMINATIM_CACHE.get(url);
     if (cached && (Date.now() - cached.timestamp < NOMINATIM_TTL_MS)) {
-        return cached.data;
+        return {
+            data: cached.data,
+            cached: true,
+            cache_age_ms: Date.now() - cached.timestamp,
+            timestamp: new Date(cached.timestamp).toISOString()
+        };
     }
 
-    const now = Date.now();
-    const timeSinceLast = now - lastNominatimRequestTime;
-    if (timeSinceLast < 1000) {
-        await new Promise(resolve => setTimeout(resolve, 1000 - timeSinceLast));
+    await nominatimRateLimit();
+
+    // Check cache again after waiting in queue in case a concurrent caller populated the same URL
+    const cachedAfterWait = NOMINATIM_CACHE.get(url);
+    if (cachedAfterWait && (Date.now() - cachedAfterWait.timestamp < NOMINATIM_TTL_MS)) {
+        return {
+            data: cachedAfterWait.data,
+            cached: true,
+            cache_age_ms: Date.now() - cachedAfterWait.timestamp,
+            timestamp: new Date(cachedAfterWait.timestamp).toISOString()
+        };
     }
-    lastNominatimRequestTime = Date.now();
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -525,7 +834,7 @@ async function fetchNominatim(url: string): Promise<any> {
     try {
         const response = await fetch(url, {
             headers: {
-                'User-Agent': `${SERVER_NAME}/${SERVER_VERSION} (https://github.com/iamvibhorsingh/bbox-mcp-server)`,
+                'User-Agent': APP_USER_AGENT,
                 'Accept': 'application/json'
             },
             signal: controller.signal
@@ -536,8 +845,14 @@ async function fetchNominatim(url: string): Promise<any> {
         }
 
         const data = await response.json();
-        NOMINATIM_CACHE.set(url, { timestamp: Date.now(), data });
-        return data;
+        const now = Date.now();
+        NOMINATIM_CACHE.set(url, { timestamp: now, data });
+        return {
+            data,
+            cached: false,
+            cache_age_ms: 0,
+            timestamp: new Date(now).toISOString()
+        };
     } catch (err: any) {
         if (err.name === 'AbortError') {
             throw new Error(`Nominatim request timed out after ${FETCH_TIMEOUT_MS / 1000}s for URL: ${url}`);
@@ -557,17 +872,23 @@ interface GeocodeResultItem {
     type?: string;
     osm_type?: string;
     osm_id?: number;
+    polygons_with_holes?: number[][][][];
 }
 
 interface GeocodeResult extends GeocodeResultItem {
     alternatives: GeocodeResultItem[];
+    provenance: ProvenanceMetadata;
 }
 
-async function geocodeLocation(query: string): Promise<GeocodeResult> {
+const PHOTON_CACHE = new Map<string, { timestamp: number; data: any }>();
+
+async function geocodeLocation(query: string, includePolygon: boolean = false, warnings?: string[]): Promise<GeocodeResult> {
     // 1. Try Nominatim first (free, returns exact OSM area boundaries & alternatives)
     try {
-        const nominatimUrl = `${NOMINATIM_BASE_URL}/search?q=${encodeURIComponent(query)}&format=json&addressdetails=1&extratags=1&limit=5`;
-        const items = await fetchNominatim(nominatimUrl);
+        const polyParam = includePolygon ? "&polygon_geojson=1" : "";
+        const emailParam = process.env.NOMINATIM_EMAIL ? `&email=${encodeURIComponent(process.env.NOMINATIM_EMAIL)}` : "";
+        const nominatimUrl = `${NOMINATIM_BASE_URL}/search?q=${encodeURIComponent(query)}&format=json&addressdetails=1&extratags=1&limit=5${polyParam}${emailParam}`;
+        const { data: items, cached, cache_age_ms, timestamp } = await fetchNominatim(nominatimUrl);
 
         if (Array.isArray(items) && items.length > 0) {
             const parsedItems: GeocodeResultItem[] = items.map((item: any) => {
@@ -594,6 +915,8 @@ async function geocodeLocation(query: string): Promise<GeocodeResult> {
                     osm_area_id = 2400000000 + osmIdNum;
                 }
 
+                const polygons_with_holes = item.geojson ? (extractPolygonsWithHolesLatLng(item.geojson) || undefined) : undefined;
+
                 return {
                     matched_place: item.display_name,
                     bbox,
@@ -602,11 +925,11 @@ async function geocodeLocation(query: string): Promise<GeocodeResult> {
                     class: item.class,
                     type: item.type,
                     osm_type: item.osm_type,
-                    osm_id: osmIdNum
+                    osm_id: osmIdNum,
+                    ...(polygons_with_holes ? { polygons_with_holes } : {})
                 };
             });
 
-            // Boundary relation preference: prefer relation with class=boundary or type=administrative/boundary
             let primaryIndex = parsedItems.findIndex(i =>
                 i.osm_type === "relation" &&
                 (i.class === "boundary" || i.type === "administrative" || i.type === "boundary")
@@ -618,14 +941,109 @@ async function geocodeLocation(query: string): Promise<GeocodeResult> {
 
             return {
                 ...primary,
-                alternatives
+                alternatives,
+                provenance: {
+                    provider: `nominatim (${NOMINATIM_BASE_URL})`,
+                    attribution: OSM_ATTRIBUTION,
+                    data_timestamp: timestamp,
+                    cached,
+                    cache_age_ms,
+                    usage_policy: "https://operations.osmfoundation.org/policies/nominatim/ (max 1 req/s, cache results, set NOMINATIM_API_URL for high-volume/shared deployments)"
+                }
             };
         }
     } catch (err: any) {
-        log('warn', `Nominatim geocoding failed for '${query}', trying Mapbox fallback`, { error: err.message });
+        log('warn', `Nominatim geocoding failed for '${query}', trying fallback provider`, { error: err.message });
     }
 
-    // 2. Fallback to Mapbox if available
+    // 2. Fallback to Photon (Komoot) — configurable via PHOTON_API_URL, cached & rate-limited
+    try {
+        const photonUrl = `${PHOTON_BASE_URL}/api/?q=${encodeURIComponent(query)}&limit=5`;
+        let data: any;
+        let cached = false;
+        let cache_age_ms = 0;
+        let timestamp = new Date().toISOString();
+
+        const cachedEntry = PHOTON_CACHE.get(photonUrl);
+        if (cachedEntry && (Date.now() - cachedEntry.timestamp < NOMINATIM_TTL_MS)) {
+            data = cachedEntry.data;
+            cached = true;
+            cache_age_ms = Date.now() - cachedEntry.timestamp;
+            timestamp = new Date(cachedEntry.timestamp).toISOString();
+        } else {
+            await photonRateLimit();
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+            try {
+                const response = await fetch(photonUrl, {
+                    headers: {
+                        'User-Agent': APP_USER_AGENT,
+                        'Accept': 'application/json'
+                    },
+                    signal: controller.signal
+                });
+                if (response.ok) {
+                    data = await response.json();
+                    const now = Date.now();
+                    PHOTON_CACHE.set(photonUrl, { timestamp: now, data });
+                    timestamp = new Date(now).toISOString();
+                }
+            } finally {
+                clearTimeout(timeout);
+            }
+        }
+
+        if (data && Array.isArray(data.features) && data.features.length > 0) {
+            if (PHOTON_BASE_URL.includes("photon.komoot.io")) {
+                warnings?.push("Used public Photon demo server (photon.komoot.io) as geocoding fallback; extensive usage may be throttled. Configure NOMINATIM_API_URL, PHOTON_API_URL, or MAPBOX_ACCESS_TOKEN for production.");
+            }
+            const photonItems: GeocodeResultItem[] = data.features.map((f: any) => {
+                const coords = f.geometry?.coordinates || [0, 0];
+                const center = { lat: coords[1], lng: coords[0] };
+                const props = f.properties || {};
+                let bbox: BBox;
+                if (Array.isArray(props.extent) && props.extent.length === 4) {
+                    bbox = ensureValidBBox(props.extent[3], props.extent[0], props.extent[1], props.extent[2]);
+                } else {
+                    bbox = ensureValidBBox(center.lat - 0.05, center.lng - 0.05, center.lat + 0.05, center.lng + 0.05);
+                }
+                const osmTypeMap: Record<string, string> = { R: "relation", W: "way", N: "node" };
+                const osm_type = osmTypeMap[props.osm_type] || props.osm_type;
+                const osm_id = typeof props.osm_id === 'number' ? props.osm_id : parseInt(props.osm_id, 10);
+                let osm_area_id: number | undefined;
+                if (osm_type === "relation" && !isNaN(osm_id)) osm_area_id = 3600000000 + osm_id;
+                else if (osm_type === "way" && !isNaN(osm_id)) osm_area_id = 2400000000 + osm_id;
+
+                const labelParts = [props.name, props.city, props.state, props.country].filter(Boolean);
+                return {
+                    matched_place: labelParts.length > 0 ? labelParts.join(", ") : query,
+                    bbox,
+                    center,
+                    osm_area_id,
+                    class: props.osm_key,
+                    type: props.osm_value,
+                    osm_type,
+                    osm_id: !isNaN(osm_id) ? osm_id : undefined
+                };
+            });
+            return {
+                ...photonItems[0],
+                alternatives: photonItems.slice(1),
+                provenance: {
+                    provider: `photon (${PHOTON_BASE_URL})`,
+                    attribution: OSM_ATTRIBUTION,
+                    data_timestamp: timestamp,
+                    cached,
+                    cache_age_ms,
+                    usage_policy: "https://github.com/komoot/photon#demo-server (public demo server; extensive usage may be throttled)"
+                }
+            };
+        }
+    } catch (err: any) {
+        log('warn', `Photon fallback geocoding failed for '${query}'`, { error: err.message });
+    }
+
+    // 3. Optional fallback to Mapbox if configured
     if (MAPBOX_ACCESS_TOKEN) {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -668,7 +1086,14 @@ async function geocodeLocation(query: string): Promise<GeocodeResult> {
 
             return {
                 ...primary,
-                alternatives
+                alternatives,
+                provenance: {
+                    provider: "mapbox (api.mapbox.com)",
+                    attribution: "© Mapbox © OpenStreetMap",
+                    data_timestamp: new Date().toISOString(),
+                    cached: false,
+                    cache_age_ms: 0
+                }
             };
         } catch (err: any) {
             if (err.name === 'AbortError') {
@@ -693,6 +1118,9 @@ interface ReverseGeocodeResult {
     osm_type?: string;
     osm_id?: number;
     share_url: string;
+    provenance: ProvenanceMetadata;
+    complete: boolean;
+    warnings: string[];
 }
 
 async function reverseGeocode(lat: number, lng: number, zoom: number = 18): Promise<ReverseGeocodeResult> {
@@ -700,9 +1128,10 @@ async function reverseGeocode(lat: number, lng: number, zoom: number = 18): Prom
         throw new Error(`Invalid lat/lng coordinates for reverse geocoding: (${lat}, ${lng})`);
     }
     const clampedZoom = Math.max(0, Math.min(18, Math.round(zoom)));
-    const url = `${NOMINATIM_BASE_URL}/reverse?format=json&lat=${lat}&lon=${lng}&zoom=${clampedZoom}&addressdetails=1`;
+    const emailParam = process.env.NOMINATIM_EMAIL ? `&email=${encodeURIComponent(process.env.NOMINATIM_EMAIL)}` : "";
+    const url = `${NOMINATIM_BASE_URL}/reverse?format=json&lat=${lat}&lon=${lng}&zoom=${clampedZoom}&addressdetails=1${emailParam}`;
 
-    const data = await fetchNominatim(url);
+    const { data, cached, cache_age_ms, timestamp } = await fetchNominatim(url);
     if (!data || !data.display_name) {
         throw new Error(`No reverse geocoding results found for coordinates: (${lat}, ${lng})`);
     }
@@ -718,18 +1147,28 @@ async function reverseGeocode(lat: number, lng: number, zoom: number = 18): Prom
         bbox = ensureValidBBox(lat - 0.005, lng - 0.005, lat + 0.005, lng + 0.005);
     }
 
-    const shareUrl = buildShareUrl(bbox);
+    const shareUrl = buildShareUrlMarkersOnly([{ coordinates: { lat, lon: lng }, name: data.display_name }]);
 
     return {
         matched_place: data.display_name,
         center: { lat, lng },
         bbox,
         address: data.address || {},
-        class: data.class,
-        type: data.type,
-        osm_type: data.osm_type,
-        osm_id: data.osm_id ? parseInt(data.osm_id, 10) : undefined,
-        share_url: shareUrl
+        ...(data.class ? { class: String(data.class) } : {}),
+        ...(data.type ? { type: String(data.type) } : {}),
+        ...(data.osm_type ? { osm_type: String(data.osm_type) } : {}),
+        ...(data.osm_id ? { osm_id: parseInt(data.osm_id, 10) } : {}),
+        share_url: shareUrl,
+        provenance: {
+            provider: `nominatim (${NOMINATIM_BASE_URL})`,
+            attribution: OSM_ATTRIBUTION,
+            data_timestamp: timestamp,
+            cached,
+            cache_age_ms,
+            usage_policy: "https://operations.osmfoundation.org/policies/nominatim/"
+        },
+        complete: true,
+        warnings: []
     };
 }
 
@@ -801,49 +1240,347 @@ function calculateHaversineDistanceMeters(lat1: number, lng1: number, lat2: numb
     return R * c;
 }
 
-async function getTaginfoSuggestions(keyword: string): Promise<string> {
-    const url = `https://taginfo.openstreetmap.org/api/4/search/by_keyword?query=${encodeURIComponent(keyword)}&rp=30`;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+function calculateBearingDegrees(lat1: number, lng1: number, lat2: number, lng2: number): { degrees: number; cardinal: string } {
+    const phi1 = (lat1 * Math.PI) / 180;
+    const phi2 = (lat2 * Math.PI) / 180;
+    const dLambda = ((lng2 - lng1) * Math.PI) / 180;
+    const y = Math.sin(dLambda) * Math.cos(phi2);
+    const x = Math.cos(phi1) * Math.sin(phi2) - Math.sin(phi1) * Math.cos(phi2) * Math.cos(dLambda);
+    const theta = Math.atan2(y, x);
+    const degrees = ((theta * 180) / Math.PI + 360) % 360;
+    const dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
+    const cardinal = dirs[Math.round(degrees / 22.5) % 16];
+    return { degrees: Math.round(degrees * 100) / 100, cardinal };
+}
+
+function isPointInPolygonRing(lat: number, lng: number, ringLatLng: number[][]): boolean {
+    let inside = false;
+    for (let i = 0, j = ringLatLng.length - 1; i < ringLatLng.length; j = i++) {
+        const yi = ringLatLng[i][0], xi = ringLatLng[i][1];
+        const yj = ringLatLng[j][0], xj = ringLatLng[j][1];
+        const intersect = ((yi > lat) !== (yj > lat)) &&
+            (lng < ((xj - xi) * (lat - yi)) / (yj - yi + 1e-15) + xi);
+        if (intersect) inside = !inside;
+    }
+    return inside;
+}
+
+function isPointInPolygonWithHoles(lat: number, lng: number, polyRingsLatLng: number[][][]): boolean {
+    if (!polyRingsLatLng || polyRingsLatLng.length === 0) return false;
+    if (!isPointInPolygonRing(lat, lng, polyRingsLatLng[0])) return false;
+    for (let h = 1; h < polyRingsLatLng.length; h++) {
+        if (isPointInPolygonRing(lat, lng, polyRingsLatLng[h])) {
+            return false; // Point lies inside an interior hole
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Overpass & Taginfo Bounded LRU Caches + Shared Overpass Executor
+// ---------------------------------------------------------------------------
+
+const OVERPASS_CACHE = new Map<string, { timestamp: number; data: any; endpoint: string }>();
+const OVERPASS_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+const OVERPASS_CACHE_MAX = 100;
+const OVERPASS_INFLIGHT = new Map<string, Promise<OverpassExecutionResult>>();
+let preferredOverpassEndpoint: string | null = null;
+
+const TAGINFO_CACHE = new Map<string, { timestamp: number; text: string; tags: string[] }>();
+const TAGINFO_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+const ROUTE_CACHE = new Map<string, { timestamp: number; data: any; provider: string }>();
+const ROUTE_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+const ELEVATION_CACHE = new Map<string, { timestamp: number; elevations: number[] }>();
+const ELEVATION_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+interface OverpassExecutionResult {
+    data: any;
+    provenance: ProvenanceMetadata;
+    remarkWarning?: string;
+}
+
+async function executeOverpassQuery(overpassQuery: string, timeoutSec: number): Promise<OverpassExecutionResult> {
+    const cached = OVERPASS_CACHE.get(overpassQuery);
+    if (cached && (Date.now() - cached.timestamp < OVERPASS_CACHE_TTL_MS)) {
+        log('info', 'Overpass cache hit');
+        const osmTimestamp = cached.data.osm3s?.timestamp_osm_base || new Date(cached.timestamp).toISOString();
+        return {
+            data: cached.data,
+            provenance: {
+                provider: `overpass (${cached.endpoint})`,
+                attribution: OSM_ATTRIBUTION,
+                data_timestamp: osmTimestamp,
+                cached: true,
+                cache_age_ms: Date.now() - cached.timestamp
+            }
+        };
+    }
+
+    const existingInflight = OVERPASS_INFLIGHT.get(overpassQuery);
+    if (existingInflight) {
+        log('info', 'Joining in-flight Overpass query');
+        return existingInflight;
+    }
+
+    const promise = executeOverpassQueryUncached(overpassQuery, timeoutSec).finally(() => {
+        OVERPASS_INFLIGHT.delete(overpassQuery);
+    });
+    OVERPASS_INFLIGHT.set(overpassQuery, promise);
+    return promise;
+}
+
+async function executeOverpassQueryUncached(overpassQuery: string, timeoutSec: number): Promise<OverpassExecutionResult> {
+    // Distinct independent operators:
+    // 1. overpass-api.de (FOSSGIS / main German instance)
+    // 2. overpass.private.coffee (Private.coffee — successor to Kumi Systems)
+    // 3. overpass.openstreetmap.fr (OSM France instance)
+    // 4. maps.mail.ru (VK Maps independent Overpass mirror)
+    const defaultEndpoints = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.private.coffee/api/interpreter",
+        "https://overpass.openstreetmap.fr/api/interpreter",
+        "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
+    ];
+    const customEndpoints = process.env.OVERPASS_API_URL
+        ? process.env.OVERPASS_API_URL.split(",").map(s => s.trim()).filter(Boolean)
+        : [];
+    const baseEndpoints = process.env.OVERPASS_DISABLE_PUBLIC_FALLBACK === "1" && customEndpoints.length > 0
+        ? customEndpoints
+        : [...customEndpoints, ...defaultEndpoints];
+    const endpoints = preferredOverpassEndpoint
+        ? [preferredOverpassEndpoint, ...baseEndpoints.filter(e => e !== preferredOverpassEndpoint)]
+        : baseEndpoints;
+
+    const params = new URLSearchParams();
+    params.append('data', overpassQuery);
+    const bodyStr = params.toString();
+
+    const clientTimeoutMs = endpoints.length > 1
+        ? Math.min((timeoutSec + 5) * 1000, 18000)
+        : (timeoutSec + 5) * 1000;
+
+    // Adaptive hedging: start endpoint[0] immediately; start each subsequent endpoint
+    // either after 1200ms OR immediately if the previous endpoint fails early (e.g. HTTP 502/504).
+    const controllers: AbortController[] = [];
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    const startCallbacks: Array<() => void> = [];
+    let settled = false;
+
+    const queryEndpoint = (endpoint: string, idx: number): Promise<{ data: any; endpoint: string }> =>
+        new Promise((resolve, reject) => {
+            let started = false;
+            const startRequest = async () => {
+                if (started) return;
+                started = true;
+                if (settled) {
+                    reject(new Error("Cancelled"));
+                    return;
+                }
+                const controller = new AbortController();
+                controllers.push(controller);
+                const timeout = setTimeout(() => controller.abort(), clientTimeoutMs);
+                try {
+                    log('info', `Executing Overpass query at ${endpoint}`);
+                    const response = await fetch(endpoint, {
+                        method: "POST",
+                        body: bodyStr,
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                            'Accept': 'application/json',
+                            'User-Agent': APP_USER_AGENT
+                        },
+                        signal: controller.signal
+                    });
+                    if (!response.ok) {
+                        throw new Error(`Overpass API returned status: ${response.status} ${response.statusText}`);
+                    }
+                    const candidate = await response.json();
+                    // Detect Overpass runtime errors (e.g. query timeout, out of memory) returned inside HTTP 200 JSON
+                    if (typeof candidate?.remark === 'string' && /runtime error|timed out|out of memory|error/i.test(candidate.remark)) {
+                        throw new Error(`Overpass runtime error: ${candidate.remark}`);
+                    }
+                    if (!candidate || !Array.isArray(candidate.elements)) {
+                        throw new Error(`Overpass response missing 'elements' array`);
+                    }
+                    resolve({ data: candidate, endpoint });
+                } catch (err: any) {
+                    if (!settled) {
+                        log('warn', `Overpass API failed at ${endpoint}`, { error: err.message });
+                        // Immediately wake the next endpoint in line if it hasn't started yet
+                        if (startCallbacks[idx + 1]) {
+                            startCallbacks[idx + 1]();
+                        }
+                    }
+                    reject(err);
+                } finally {
+                    clearTimeout(timeout);
+                }
+            };
+
+            startCallbacks[idx] = startRequest;
+            if (idx === 0) {
+                startRequest();
+            } else {
+                const t = setTimeout(startRequest, idx * 1200);
+                timers.push(t);
+            }
+        });
+
+    let data: any = null;
+    let usedEndpoint = endpoints[0];
+
+    try {
+        const winner = await Promise.any(
+            endpoints.map((ep, idx) => queryEndpoint(ep, idx))
+        );
+        settled = true;
+        data = winner.data;
+        usedEndpoint = winner.endpoint;
+        preferredOverpassEndpoint = usedEndpoint;
+    } catch (aggErr: any) {
+        settled = true;
+        const errors: Error[] = Array.isArray(aggErr?.errors) ? aggErr.errors : [aggErr];
+        const nonAbort = errors.find(e => e && e.name !== 'AbortError' && e.message !== 'Cancelled');
+        if (!nonAbort && errors.some(e => e?.name === 'AbortError')) {
+            throw new Error(`Overpass API request timed out on all endpoints after ${clientTimeoutMs / 1000}s. The query or area may be too large.`);
+        }
+        const errMsg = (nonAbort || errors[0])?.message || "Unknown Overpass error";
+        throw new Error(`Overpass query failed on all endpoints: ${errMsg}`);
+    } finally {
+        settled = true;
+        for (const t of timers) clearTimeout(t);
+        for (const c of controllers) {
+            try { c.abort(); } catch { /* ignore */ }
+        }
+    }
+
+    const now = Date.now();
+    if (OVERPASS_CACHE.size >= OVERPASS_CACHE_MAX) {
+        const oldestKey = OVERPASS_CACHE.keys().next().value;
+        if (oldestKey) OVERPASS_CACHE.delete(oldestKey);
+    }
+    OVERPASS_CACHE.set(overpassQuery, { timestamp: now, data, endpoint: usedEndpoint });
+
+    const osmTimestamp = data.osm3s?.timestamp_osm_base || new Date(now).toISOString();
+    return {
+        data,
+        provenance: {
+            provider: `overpass (${usedEndpoint})`,
+            attribution: OSM_ATTRIBUTION,
+            data_timestamp: osmTimestamp,
+            cached: false,
+            cache_age_ms: 0
+        },
+        remarkWarning: typeof data.remark === 'string' ? data.remark : undefined
+    };
+}
+
+async function getTaginfoSuggestions(keyword: string): Promise<{ text: string; tags: string[]; cached: boolean; cache_age_ms: number; timestamp: string; warning?: string }> {
+    const cacheKey = keyword.toLowerCase().trim();
+    const cached = TAGINFO_CACHE.get(cacheKey);
+    if (cached && (Date.now() - cached.timestamp < TAGINFO_CACHE_TTL_MS)) {
+        return {
+            text: cached.text,
+            tags: cached.tags,
+            cached: true,
+            cache_age_ms: Date.now() - cached.timestamp,
+            timestamp: new Date(cached.timestamp).toISOString()
+        };
+    }
 
     const MAINSTREAM_KEYS = new Set([
         "amenity", "shop", "leisure", "tourism", "natural", "highway",
         "office", "healthcare", "craft", "sport", "landuse", "building",
-        "historic", "emergency", "railway", "aeroway", "public_transport"
+        "historic", "emergency", "railway", "aeroway", "public_transport",
+        "man_made", "Waterway", "waterway", "barrier", "power", "place"
     ]);
 
-    try {
-        const response = await fetch(url, {
-            headers: { 'User-Agent': `${SERVER_NAME}/${SERVER_VERSION} (https://github.com/iamvibhorsingh/bbox-mcp-server)` },
-            signal: controller.signal
-        });
-        if (!response.ok) {
-            throw new Error(`Taginfo status: ${response.status}`);
-        }
-        const data = await response.json();
-        const results = data.data || [];
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-        const filtered = results
-            .filter((item: any) =>
-                item.key &&
-                MAINSTREAM_KEYS.has(item.key) &&
-                (item.count_all ?? 0) >= 1000
-            )
+    try {
+        let items: Array<{ key: string; value?: string; count_all?: number }> = [];
+
+        if (MAINSTREAM_KEYS.has(cacheKey)) {
+            // User asked for a top-level OSM key (e.g. "amenity", "shop", "tourism") -> fetch its most popular values
+            const keyUrl = `https://taginfo.openstreetmap.org/api/4/keys/values?key=${encodeURIComponent(cacheKey)}&sortname=count_all&sortorder=desc&rp=15`;
+            const res = await fetch(keyUrl, { headers: { 'User-Agent': APP_USER_AGENT }, signal: controller.signal });
+            if (res.ok) {
+                const json = await res.json();
+                items = (json.data || []).map((d: any) => ({ key: cacheKey, value: d.value, count_all: d.count }));
+            }
+        } else {
+            // Query both by_value (sorted by real-world count_all) and by_keyword (matches natural-language wiki terms)
+            const valUrl = `https://taginfo.openstreetmap.org/api/4/search/by_value?query=${encodeURIComponent(keyword)}&sortname=count_all&sortorder=desc&rp=25`;
+            const kwUrl = `https://taginfo.openstreetmap.org/api/4/search/by_keyword?query=${encodeURIComponent(keyword)}&rp=25`;
+            const [valRes, kwRes] = await Promise.allSettled([
+                fetch(valUrl, { headers: { 'User-Agent': APP_USER_AGENT }, signal: controller.signal }),
+                fetch(kwUrl, { headers: { 'User-Agent': APP_USER_AGENT }, signal: controller.signal })
+            ]);
+            if (valRes.status === "fulfilled" && valRes.value.ok) {
+                const json = await valRes.value.json();
+                items.push(...(json.data || []));
+            }
+            if (kwRes.status === "fulfilled" && kwRes.value.ok) {
+                const json = await kwRes.value.json();
+                items.push(...(json.data || []));
+            }
+        }
+
+        const seenSelectors = new Set<string>();
+        const filtered = items
+            .filter((item: any) => {
+                if (!item.key || !MAINSTREAM_KEYS.has(item.key)) return false;
+                if (item.count_all !== undefined && item.count_all < 1000) return false;
+                const valStr = item.value ? `="${item.value}"` : '';
+                const selector = `nwr["${item.key}"${valStr}]`;
+                if (seenSelectors.has(selector)) return false;
+                seenSelectors.add(selector);
+                return true;
+            })
             .sort((a: any, b: any) => (b.count_all ?? 0) - (a.count_all ?? 0))
             .slice(0, 10);
 
+        const now = Date.now();
         if (filtered.length === 0) {
-            return `No mainstream OSM tags found for '${keyword}' with usage count > 1,000.\nTry searching standard keys like amenity, shop, leisure, or tourism.`;
+            const text = `No mainstream OSM tags found for '${keyword}' with usage count > 1,000.\nTry searching standard keys like amenity, shop, leisure, or tourism.`;
+            return {
+                text,
+                tags: [],
+                cached: false,
+                cache_age_ms: 0,
+                timestamp: new Date(now).toISOString()
+            };
         }
 
+        const tags: string[] = [];
         const lines = filtered.map((item: any) => {
             const valStr = item.value ? `="${item.value}"` : '';
-            return `- nwr["${item.key}"${valStr}] (${(item.count_all || 0).toLocaleString()} objects)`;
+            const selector = `nwr["${item.key}"${valStr}]`;
+            tags.push(selector);
+            const countInfo = item.count_all !== undefined ? ` (${item.count_all.toLocaleString()} objects)` : '';
+            return `- ${selector}${countInfo}`;
         });
 
-        return `Taginfo OSM Tag Recommendations for '${keyword}':\n\n${lines.join('\n')}`;
+        const text = `Taginfo OSM Tag Recommendations for '${keyword}':\n\n${lines.join('\n')}`;
+        TAGINFO_CACHE.set(cacheKey, { timestamp: now, text, tags });
+        return {
+            text,
+            tags,
+            cached: false,
+            cache_age_ms: 0,
+            timestamp: new Date(now).toISOString()
+        };
     } catch (err: any) {
-        return `Taginfo lookup failed for '${keyword}': ${err.message}`;
+        return {
+            text: `Taginfo lookup failed for '${keyword}': ${err.message}`,
+            tags: [],
+            cached: false,
+            cache_age_ms: 0,
+            timestamp: new Date().toISOString(),
+            warning: `Taginfo lookup failed: ${err.message}`
+        };
     } finally {
         clearTimeout(timeout);
     }
@@ -871,22 +1608,57 @@ function buildShareUrlCircleWithMarkers(
 // Tool Handlers
 // ---------------------------------------------------------------------------
 
+const BBOX_OBJ_SCHEMA = {
+    type: "object" as const,
+    properties: {
+        lat1: { type: "number" as const },
+        lng1: { type: "number" as const },
+        lat2: { type: "number" as const },
+        lng2: { type: "number" as const }
+    },
+    required: ["lat1", "lng1", "lat2", "lng2"]
+};
+
+const PROVENANCE_SCHEMA = {
+    type: "object" as const,
+    properties: {
+        provider: { type: "string" as const },
+        attribution: { type: "string" as const },
+        data_timestamp: { type: "string" as const },
+        cached: { type: "boolean" as const },
+        cache_age_ms: { type: "number" as const },
+        usage_policy: { type: "string" as const }
+    },
+    required: ["provider", "data_timestamp", "cached", "cache_age_ms"]
+};
+
 server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
         tools: [
             {
                 name: "get_bounds",
-                description: "Get converted coordinates for a bounding box or text location search. Supports parsing WKT, GeoJSON, ogrinfo extent, and raw coordinate strings. If MAPBOX_ACCESS_TOKEN is not set, you MUST provide explicit coordinates via 'bbox'.",
+                description: "Get converted coordinates for a bounding box or natural-language location search (powered by Nominatim with configurable Photon & optional Mapbox fallbacks). Supports parsing WKT, GeoJSON, ogrinfo extent, Web Mercator tiles ('z/x/y'), single points ('lat,lng'), and raw coordinate strings, plus optional metric buffering.",
+                annotations: {
+                    title: "Get Bounding Box & Projections",
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: true
+                },
                 inputSchema: {
                     type: "object",
                     properties: {
                         location: {
                             type: "string",
-                            description: "A text location to search for (e.g. 'New York City'). Requires MAPBOX_ACCESS_TOKEN env var. Either 'location' or 'bbox' MUST be provided."
+                            description: "A text location to search for (e.g. 'New York City', 'Central Park'). Uses OpenStreetMap Nominatim (or configurable NOMINATIM_API_URL / PHOTON_API_URL / optional MAPBOX_ACCESS_TOKEN). Either 'location' or 'bbox' MUST be provided."
                         },
                         bbox: {
                             type: "string",
-                            description: "The geometry to parse. Can be a raw bounding box string ('lat1,lng1,lat2,lng2'), a WKT polygon/linestring/point, a GeoJSON payload, or an `ogrinfo` extent block. The Minimum Bounding Rectangle (MBR) encapsulating the geometry will be extracted. Either 'location' or 'bbox' MUST be provided."
+                            description: "The geometry to parse. Can be a raw bounding box string ('lat1,lng1,lat2,lng2'), a single point ('lat,lng'), a Web Mercator tile ('z/x/y'), a WKT polygon/linestring/point, a GeoJSON payload, or an `ogrinfo` extent block. Either 'location' or 'bbox' MUST be provided."
+                        },
+                        buffer_meters: {
+                            type: "number",
+                            description: "Optional distance in meters to expand (positive) or shrink (negative) the bounding box in all directions. Ideal for creating a bounding box around a single point."
                         },
                         epsg: {
                             type: "string",
@@ -916,10 +1688,60 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         { required: ["bbox"] }
                     ]
                 },
+                outputSchema: {
+                    type: "object",
+                    properties: {
+                        matched_place: { type: "string" },
+                        alternatives: { type: "array", items: { type: "object" } },
+                        original_wgs84: BBOX_OBJ_SCHEMA,
+                        projected: {
+                            type: "object",
+                            properties: {
+                                xmin: { type: "number" },
+                                ymin: { type: "number" },
+                                xmax: { type: "number" },
+                                ymax: { type: "number" }
+                            },
+                            required: ["xmin", "ymin", "xmax", "ymax"]
+                        },
+                        center: {
+                            type: "object",
+                            properties: { lat: { type: "number" }, lng: { type: "number" } },
+                            required: ["lat", "lng"]
+                        },
+                        tile_indices: {
+                            type: "object",
+                            properties: { x: { type: "number" }, y: { type: "number" }, z: { type: "number" } },
+                            required: ["x", "y", "z"]
+                        },
+                        epsg: { type: "string" },
+                        format: { type: "string" },
+                        coord_order: { type: "string" },
+                        precision: { type: "number" },
+                        area_km2: { type: "number" },
+                        dimensions: {
+                            type: "object",
+                            properties: { width_km: { type: "number" }, height_km: { type: "number" } },
+                            required: ["width_km", "height_km"]
+                        },
+                        share_url: { type: "string" },
+                        provenance: PROVENANCE_SCHEMA,
+                        complete: { type: "boolean" },
+                        warnings: { type: "array", items: { type: "string" } }
+                    },
+                    required: ["original_wgs84", "projected", "center", "tile_indices", "epsg", "format", "coord_order", "precision", "area_km2", "dimensions", "share_url", "provenance", "complete", "warnings"]
+                }
             },
             {
                 name: "get_h3_indices",
-                description: "Get Uber H3 cell indices for a bounding box area at a target resolution. Input supports WKT, GeoJSON, ogrinfo extent, and raw coordinate strings.",
+                description: "Get Uber H3 cell indices for a polygon (including interior holes), location boundary, or bounding box at a target resolution. When a WKT/GeoJSON polygon or named location boundary is provided, fills the exact polygon geometry (subtracting interior holes) rather than just its bounding rectangle.",
+                annotations: {
+                    title: "Generate H3 Hexagonal Grid Indices",
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: true
+                },
                 inputSchema: {
                     type: "object",
                     properties: {
@@ -929,7 +1751,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         },
                         bbox: {
                             type: "string",
-                            description: "The geometry to parse. Can be a raw bounding box string ('lat1,lng1,lat2,lng2'), WKT, GeoJSON, or ogrinfo extent. Either 'location' or 'bbox' MUST be provided.",
+                            description: "The geometry to parse. Can be a raw bounding box string ('lat1,lng1,lat2,lng2'), WKT polygon (with optional holes), GeoJSON polygon/multipolygon, tile 'z/x/y', or ogrinfo extent. Either 'location' or 'bbox' MUST be provided.",
                         },
                         resolution: {
                             type: "number",
@@ -946,6 +1768,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         return_geometry: {
                             type: "boolean",
                             description: "If true, return GeoJSON FeatureCollection with hex boundary polygons in addition to cell IDs. Defaults to false."
+                        },
+                        use_polygon_boundary: {
+                            type: "boolean",
+                            description: "If true (default), fills the exact WKT/GeoJSON/OSM polygon boundary (including interior holes) instead of its rectangular bounding box when available."
                         }
                     },
                     required: ["resolution"],
@@ -954,24 +1780,68 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         { required: ["bbox"] }
                     ]
                 },
+                outputSchema: {
+                    type: "object",
+                    properties: {
+                        resolution: { type: "number" },
+                        compact: { type: "boolean" },
+                        summary_only: { type: "boolean" },
+                        used_polygon_boundary: { type: "boolean" },
+                        cell_count: { type: "number" },
+                        cells: { type: "array", items: { type: "string" } },
+                        sample_cells: { type: "array", items: { type: "string" } },
+                        geojson: { type: "object" },
+                        original_bbox: BBOX_OBJ_SCHEMA,
+                        share_url: { type: "string" },
+                        provenance: PROVENANCE_SCHEMA,
+                        complete: { type: "boolean" },
+                        warnings: { type: "array", items: { type: "string" } }
+                    },
+                    required: ["resolution", "compact", "summary_only", "used_polygon_boundary", "cell_count", "original_bbox", "share_url", "provenance", "complete", "warnings"]
+                }
             },
             {
                 name: "generate_share_url",
-                description: "Generates a URL that links to the visual Bounding Box tool to display these coordinates on a map. Supports WKT, GeoJSON, ogrinfo extent, and raw coordinate strings as input.",
+                description: "Generates a URL that links to the visual Bounding Box tool to display these coordinates on a map. Supports WKT, GeoJSON, ogrinfo extent, tile 'z/x/y', and raw coordinate strings as input.",
+                annotations: {
+                    title: "Generate Map Verification URL",
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: false
+                },
                 inputSchema: {
                     type: "object",
                     properties: {
                         bbox: {
                             type: "string",
-                            description: "The geometry to parse. Can be a raw bounding box string ('lat1,lng1,lat2,lng2'), WKT, GeoJSON, or ogrinfo extent.",
+                            description: "The geometry to parse. Can be a raw bounding box string ('lat1,lng1,lat2,lng2'), WKT, GeoJSON, tile 'z/x/y', or ogrinfo extent.",
                         }
                     },
                     required: ["bbox"],
                 },
+                outputSchema: {
+                    type: "object",
+                    properties: {
+                        bbox: BBOX_OBJ_SCHEMA,
+                        share_url: { type: "string" },
+                        provenance: PROVENANCE_SCHEMA,
+                        complete: { type: "boolean" },
+                        warnings: { type: "array", items: { type: "string" } }
+                    },
+                    required: ["bbox", "share_url", "provenance", "complete", "warnings"]
+                }
             },
             {
                 name: "reverse_geocode",
                 description: "Reverse geocode latitude and longitude coordinates to discover context, place name, address components, and OSM details ('what is here?').",
+                annotations: {
+                    title: "Reverse Geocode Coordinates",
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: true
+                },
                 inputSchema: {
                     type: "object",
                     properties: {
@@ -989,11 +1859,40 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         }
                     },
                     required: ["lat", "lng"]
+                },
+                outputSchema: {
+                    type: "object",
+                    properties: {
+                        matched_place: { type: "string" },
+                        center: {
+                            type: "object",
+                            properties: { lat: { type: "number" }, lng: { type: "number" } },
+                            required: ["lat", "lng"]
+                        },
+                        bbox: BBOX_OBJ_SCHEMA,
+                        address: { type: "object" },
+                        class: { type: "string" },
+                        type: { type: "string" },
+                        osm_type: { type: "string" },
+                        osm_id: { type: "number" },
+                        share_url: { type: "string" },
+                        provenance: PROVENANCE_SCHEMA,
+                        complete: { type: "boolean" },
+                        warnings: { type: "array", items: { type: "string" } }
+                    },
+                    required: ["matched_place", "center", "bbox", "address", "share_url", "provenance", "complete", "warnings"]
                 }
             },
             {
                 name: "search_overpass",
-                description: "Execute an Overpass QL query to find POIs, roads, or other OSM features within an admin boundary area, bounding box, or radius. The server wraps your query in spatial filters and returns structured JSON with distance calculations and a map link.\n\nSEARCH MODES:\n- Location / Admin Area: when 'location' resolves to an OSM boundary polygon (e.g. 'Manhattan', 'Seattle'), searches inside exact boundary polygon.\n- Bounding box (default): searches a rectangular area.\n- Circle: searches within an exact radius when 'radius_meters' is provided.\n\nCOMMON TAG EXAMPLES:\n- Restaurants: `nwr[\"amenity\"=\"restaurant\"]`\n- Pizza: `nwr[\"amenity\"=\"fast_food\"][\"cuisine\"=\"pizza\"]`\n- Supermarkets: `nwr[\"shop\"=\"supermarket\"]`\n- Parks: `nwr[\"leisure\"=\"park\"]`\n- Hospitals: `nwr[\"amenity\"=\"hospital\"]`\n- EV Charging: `nwr[\"amenity\"=\"charging_station\"]`\n- Gyms: `nwr[\"leisure\"=\"fitness_centre\"]`\n- Banks: `nwr[\"amenity\"=\"bank\"]`",
+                description: "Execute an Overpass QL query to find POIs, roads, or other OSM features within an admin boundary area, bounding box, or radius. The server wraps your query in spatial filters, detects Overpass runtime errors, and returns structured JSON with provenance, completeness metadata, distance calculations, and a map link.\n\nSEARCH MODES:\n- Location / Admin Area: when 'location' resolves to an OSM boundary polygon (e.g. 'Manhattan', 'Seattle'), searches inside exact boundary polygon.\n- Bounding box (default): searches a rectangular area.\n- Circle: searches within an exact radius when 'radius_meters' is provided.\n- Fast Count: set 'count_only: true' to get instant element counts without downloading full element payloads.\n\nCOMMON TAG EXAMPLES:\n- Restaurants: `nwr[\"amenity\"=\"restaurant\"]`\n- Pizza: `nwr[\"amenity\"=\"fast_food\"][\"cuisine\"=\"pizza\"]`\n- Supermarkets: `nwr[\"shop\"=\"supermarket\"]`\n- Parks: `nwr[\"leisure\"=\"park\"]`\n- Hospitals: `nwr[\"amenity\"=\"hospital\"]`\n- EV Charging: `nwr[\"amenity\"=\"charging_station\"]`\n- Gyms: `nwr[\"leisure\"=\"fitness_centre\"]`\n- Banks: `nwr[\"amenity\"=\"bank\"]`",
+                annotations: {
+                    title: "Search OpenStreetMap via Overpass QL",
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: true
+                },
                 inputSchema: {
                     type: "object",
                     properties: {
@@ -1036,6 +1935,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         return_geometry: {
                             type: "boolean",
                             description: "If true, returns full geometry (polygon/polyline) for ways and relations instead of center point. Defaults to false."
+                        },
+                        count_only: {
+                            type: "boolean",
+                            description: "If true, executes an ultra-fast Overpass 'out count;' query and returns total counts (nodes, ways, relations, total) without downloading individual features. Defaults to false."
                         }
                     },
                     required: ["query"],
@@ -1044,10 +1947,53 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         { required: ["bbox"] }
                     ]
                 },
+                outputSchema: {
+                    type: "object",
+                    properties: {
+                        search_mode: { type: "string" },
+                        count_only: { type: "boolean" },
+                        matched_place: { type: "string" },
+                        alternatives: { type: "array", items: { type: "object" } },
+                        osm_area_id: { type: "number" },
+                        counts: {
+                            type: "object",
+                            properties: {
+                                nodes: { type: "number" },
+                                ways: { type: "number" },
+                                relations: { type: "number" },
+                                total: { type: "number" }
+                            }
+                        },
+                        distance_from: { type: "object" },
+                        generator: { type: "string" },
+                        osm3s: { type: "object" },
+                        elements: { type: "array", items: { type: "object" } },
+                        total_count: { type: "number" },
+                        returned_count: { type: "number" },
+                        offset: { type: "number" },
+                        limit: { type: "number" },
+                        truncated: { type: "boolean" },
+                        has_more: { type: "boolean" },
+                        next_offset: { type: "number" },
+                        pagination_hint: { type: "string" },
+                        share_url: { type: "string" },
+                        provenance: PROVENANCE_SCHEMA,
+                        complete: { type: "boolean" },
+                        warnings: { type: "array", items: { type: "string" } }
+                    },
+                    required: ["search_mode", "count_only", "share_url", "provenance", "complete", "warnings"]
+                }
             },
             {
                 name: "list_osm_tags",
                 description: "Discovery tool to look up the correct OpenStreetMap tags for any category. Uses built-in category index and live Taginfo API fallback to prevent tag hallucination.",
+                annotations: {
+                    title: "Lookup OpenStreetMap Tags",
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: true
+                },
                 inputSchema: {
                     type: "object",
                     properties: {
@@ -1057,11 +2003,31 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         }
                     },
                     required: ["category"]
+                },
+                outputSchema: {
+                    type: "object",
+                    properties: {
+                        category: { type: "string" },
+                        source: { type: "string" },
+                        tags: { type: "array", items: { type: "string" } },
+                        recommendations_text: { type: "string" },
+                        provenance: PROVENANCE_SCHEMA,
+                        complete: { type: "boolean" },
+                        warnings: { type: "array", items: { type: "string" } }
+                    },
+                    required: ["category", "source", "tags", "recommendations_text", "provenance", "complete", "warnings"]
                 }
             },
             {
                 name: "aggregate_overpass_h3",
-                description: "Executes an Overpass query and bins the results into H3 hexagons at a specified resolution to analyze spatial density.",
+                description: "Executes an Overpass query and bins the results into H3 hexagons at a specified resolution to analyze spatial density. Plots the top density hotspots on the shareable verification map.",
+                annotations: {
+                    title: "Aggregate OSM Features into H3 Hexagons",
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: true
+                },
                 inputSchema: {
                     type: "object",
                     properties: {
@@ -1081,6 +2047,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                             type: "number",
                             description: "The H3 resolution level (0-15) for binning. Default is 8."
                         },
+                        radius_meters: {
+                            type: "number",
+                            description: "Optional search radius in metres around the location/bbox center."
+                        },
                         timeout_seconds: {
                             type: "number",
                             description: "Overpass server query timeout in seconds. Default is 25."
@@ -1095,6 +2065,254 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         { required: ["location"] },
                         { required: ["bbox"] }
                     ]
+                },
+                outputSchema: {
+                    type: "object",
+                    properties: {
+                        resolution: { type: "number" },
+                        matched_place: { type: "string" },
+                        alternatives: { type: "array", items: { type: "object" } },
+                        osm_area_id: { type: "number" },
+                        total_elements: { type: "number" },
+                        active_hex_count: { type: "number" },
+                        hex_counts: { type: "object" },
+                        hex_geojson: { type: "object" },
+                        original_bbox: BBOX_OBJ_SCHEMA,
+                        share_url: { type: "string" },
+                        provenance: PROVENANCE_SCHEMA,
+                        complete: { type: "boolean" },
+                        warnings: { type: "array", items: { type: "string" } }
+                    },
+                    required: ["resolution", "total_elements", "active_hex_count", "hex_counts", "hex_geojson", "original_bbox", "share_url", "provenance", "complete", "warnings"]
+                }
+            },
+            {
+                name: "calculate_route",
+                description: "Calculate real-world travel distance, duration, turn-by-turn summary, GeoJSON route geometry, and route bounding box between two locations or coordinate pairs using OpenStreetMap routing (FOSSGIS / OSRM, or configurable OSRM_API_URL). Draws the actual route path on the verification map and enforces rate limits (max 1 req/s).",
+                annotations: {
+                    title: "Calculate Route Distance, Duration & Geometry",
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: true
+                },
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        origin: {
+                            type: "string",
+                            description: "Starting point as 'lat,lng' coordinates (e.g. '40.7128,-74.0060') or a natural-language place name (e.g. 'Times Square, NYC')."
+                        },
+                        destination: {
+                            type: "string",
+                            description: "Ending point as 'lat,lng' coordinates (e.g. '40.6413,-73.7781') or a natural-language place name (e.g. 'JFK Airport')."
+                        },
+                        profile: {
+                            type: "string",
+                            description: "Travel mode profile: 'driving' (car), 'walking' (foot), or 'cycling' (bicycle). Defaults to 'driving'.",
+                            enum: ["driving", "walking", "cycling"]
+                        },
+                        return_steps: {
+                            type: "boolean",
+                            description: "If true, includes step-by-step road names and maneuver instructions. Defaults to false."
+                        }
+                    },
+                    required: ["origin", "destination"]
+                },
+                outputSchema: {
+                    type: "object",
+                    properties: {
+                        profile: { type: "string" },
+                        origin: {
+                            type: "object",
+                            properties: { lat: { type: "number" }, lng: { type: "number" }, label: { type: "string" } },
+                            required: ["lat", "lng", "label"]
+                        },
+                        destination: {
+                            type: "object",
+                            properties: { lat: { type: "number" }, lng: { type: "number" }, label: { type: "string" } },
+                            required: ["lat", "lng", "label"]
+                        },
+                        distance_meters: { type: "number" },
+                        distance_km: { type: "number" },
+                        duration_seconds: { type: "number" },
+                        duration_minutes: { type: "number" },
+                        straight_line_meters: { type: "number" },
+                        detour_factor: { type: "number" },
+                        initial_bearing: {
+                            type: "object",
+                            properties: { degrees: { type: "number" }, cardinal: { type: "string" } },
+                            required: ["degrees", "cardinal"]
+                        },
+                        route_bbox: BBOX_OBJ_SCHEMA,
+                        route_geometry: {
+                            type: "object",
+                            properties: {
+                                type: { type: "string" },
+                                coordinates: { type: "array", items: { type: "array", items: { type: "number" } } }
+                            },
+                            required: ["type", "coordinates"]
+                        },
+                        steps: { type: "array", items: { type: "object" } },
+                        share_url: { type: "string" },
+                        provenance: PROVENANCE_SCHEMA,
+                        complete: { type: "boolean" },
+                        warnings: { type: "array", items: { type: "string" } }
+                    },
+                    required: ["profile", "origin", "destination", "distance_meters", "distance_km", "duration_seconds", "duration_minutes", "straight_line_meters", "detour_factor", "initial_bearing", "route_bbox", "route_geometry", "share_url", "provenance", "complete", "warnings"]
+                }
+            },
+            {
+                name: "get_elevation",
+                description: "Query terrain elevation in meters above sea level using the Open-Meteo 90m Copernicus DEM API (free for non-commercial use; commercial use requires a paid key or self-hosted ELEVATION_API_URL). Supports querying specific point coordinates OR sampling an N×N point grid across a bounding box to compute sample statistics (note: finite grid sampling over a 90m DEM reports sample statistics, not guaranteed area-wide true minimum, maximum, or slope).",
+                annotations: {
+                    title: "Get Terrain Elevation & Sample Statistics",
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: true
+                },
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        points: {
+                            type: "array",
+                            description: "List of {lat, lng, label?} points to query elevation for (up to 100 points).",
+                            items: {
+                                type: "object",
+                                properties: {
+                                    lat: { type: "number" },
+                                    lng: { type: "number" },
+                                    label: { type: "string" }
+                                },
+                                required: ["lat", "lng"]
+                            }
+                        },
+                        location: {
+                            type: "string",
+                            description: "A text location to sample elevation across (e.g. 'Mount Rainier', 'Denver')."
+                        },
+                        bbox: {
+                            type: "string",
+                            description: "A bounding box or point string to sample terrain elevation across."
+                        },
+                        grid_size: {
+                            type: "number",
+                            description: "Grid dimension N (N x N samples, from 2 to 10) when sampling a bounding box. Defaults to 5 (25 sample points)."
+                        }
+                    }
+                },
+                outputSchema: {
+                    type: "object",
+                    properties: {
+                        mode: { type: "string" },
+                        matched_place: { type: "string" },
+                        dem_resolution_meters: { type: "number" },
+                        sample_count: { type: "number" },
+                        sample_stats: {
+                            type: "object",
+                            properties: {
+                                min_elevation_meters: { type: "number" },
+                                max_elevation_meters: { type: "number" },
+                                mean_elevation_meters: { type: "number" },
+                                sample_relief_meters: { type: "number" },
+                                lowest_sample: { type: "object" },
+                                highest_sample: { type: "object" },
+                                is_finite_sample: { type: "boolean" }
+                            },
+                            required: ["min_elevation_meters", "max_elevation_meters", "mean_elevation_meters", "sample_relief_meters", "lowest_sample", "highest_sample", "is_finite_sample"]
+                        },
+                        samples: { type: "array", items: { type: "object" } },
+                        bbox: BBOX_OBJ_SCHEMA,
+                        share_url: { type: "string" },
+                        provenance: PROVENANCE_SCHEMA,
+                        complete: { type: "boolean" },
+                        warnings: { type: "array", items: { type: "string" } }
+                    },
+                    required: ["mode", "dem_resolution_meters", "sample_count", "sample_stats", "samples", "bbox", "share_url", "provenance", "complete", "warnings"]
+                }
+            },
+            {
+                name: "spatial_calc",
+                description: "Perform deterministic offline geometric calculations on bounding boxes, points, and polygons (with holes, zero network calls): 'relation' (intersects, contains, overlap area %, union & intersection bbox between two geometries), 'point_in_geometry' (check if a point is inside a bbox or WKT/GeoJSON polygon respecting interior holes), 'distance_bearing' (exact Haversine distance, initial compass bearing, and midpoint between two points), or 'split_grid' (subdivide a bbox into an N x M grid of sub-bboxes for chunked queries).",
+                annotations: {
+                    title: "Deterministic Spatial Geometry Calculator",
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: false
+                },
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        operation: {
+                            type: "string",
+                            description: "The geometric operation to perform.",
+                            enum: ["relation", "point_in_geometry", "distance_bearing", "split_grid"]
+                        },
+                        bbox_a: {
+                            type: "string",
+                            description: "First geometry / bounding box (for 'relation', 'point_in_geometry', 'split_grid') or origin point 'lat,lng' (for 'distance_bearing')."
+                        },
+                        bbox_b: {
+                            type: "string",
+                            description: "Second geometry / bounding box (for 'relation') or destination point 'lat,lng' (for 'distance_bearing')."
+                        },
+                        point: {
+                            type: "string",
+                            description: "Point coordinates 'lat,lng' to test in 'point_in_geometry'."
+                        },
+                        rows: {
+                            type: "number",
+                            description: "Number of latitude rows for 'split_grid' (1-20, default 2)."
+                        },
+                        cols: {
+                            type: "number",
+                            description: "Number of longitude columns for 'split_grid' (1-20, default 2)."
+                        }
+                    },
+                    required: ["operation", "bbox_a"]
+                },
+                outputSchema: {
+                    type: "object",
+                    properties: {
+                        operation: { type: "string" },
+                        intersects: { type: "boolean" },
+                        a_contains_b: { type: "boolean" },
+                        b_contains_a: { type: "boolean" },
+                        area_a_km2: { type: "number" },
+                        area_b_km2: { type: "number" },
+                        intersection_area_km2: { type: "number" },
+                        union_area_km2: { type: "number" },
+                        overlap_percent_of_a: { type: "number" },
+                        overlap_percent_of_b: { type: "number" },
+                        centroid_distance_meters: { type: "number" },
+                        intersection_bbox: { type: ["object", "null"] },
+                        union_bbox: BBOX_OBJ_SCHEMA,
+                        point: { type: "object" },
+                        inside: { type: "boolean" },
+                        inside_bbox: { type: "boolean" },
+                        inside_polygon: { type: "boolean" },
+                        target_bbox: BBOX_OBJ_SCHEMA,
+                        from: { type: "object" },
+                        to: { type: "object" },
+                        distance_meters: { type: "number" },
+                        distance_km: { type: "number" },
+                        bearing_degrees: { type: "number" },
+                        cardinal_direction: { type: "string" },
+                        midpoint: { type: "object" },
+                        bbox: BBOX_OBJ_SCHEMA,
+                        rows: { type: "number" },
+                        cols: { type: "number" },
+                        total_cells: { type: "number" },
+                        original_bbox: BBOX_OBJ_SCHEMA,
+                        cells: { type: "array", items: { type: "object" } },
+                        share_url: { type: "string" },
+                        provenance: PROVENANCE_SCHEMA,
+                        complete: { type: "boolean" },
+                        warnings: { type: "array", items: { type: "string" } }
+                    },
+                    required: ["operation", "share_url", "provenance", "complete", "warnings"]
                 }
             }
         ],
@@ -1128,6 +2346,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 bboxObj = parseBBox(args.bbox as string, warnings);
             } else {
                 return { content: [{ type: "text", text: "Error: Either 'location' or 'bbox' argument must be provided." }], isError: true };
+            }
+
+            const bufferMeters = args.buffer_meters as number | undefined;
+            if (typeof bufferMeters === 'number' && bufferMeters !== 0) {
+                bboxObj = expandBBoxMeters(bboxObj, bufferMeters);
             }
 
             let epsg = args.epsg as string || "4326";
@@ -1167,36 +2390,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 ? `Alternates: ${geocodeRes.alternatives.map(a => `"${a.matched_place}"`).join(', ')}\n\n`
                 : '\n';
 
+            const provenance: ProvenanceMetadata = geocodeRes?.provenance || {
+                provider: "offline-proj4",
+                data_timestamp: new Date().toISOString(),
+                cached: false,
+                cache_age_ms: 0
+            };
+
+            const structuredData = {
+                ...(geocodeRes ? { matched_place: geocodeRes.matched_place, alternatives: geocodeRes.alternatives } : {}),
+                original_wgs84: bboxObj,
+                projected: projCoords,
+                center: {
+                    lat: centerLat,
+                    lng: centerLng
+                },
+                tile_indices: tileIndices,
+                epsg,
+                format,
+                coord_order: coordOrder,
+                precision,
+                area_km2: areaKm2,
+                dimensions: {
+                    width_km: dims.widthKm,
+                    height_km: dims.heightKm
+                },
+                share_url: shareUrl,
+                provenance,
+                complete: true,
+                warnings
+            };
+
             return {
                 content: [
                     {
                         type: "text",
                         text: `${geocodeInfo}${altInfo}Original WGS84 Bounds (${format}):\n${WGS84Formatted}\n\nProjected to EPSG:${epsg} (${format}):\n${projectedFormatted}\n\nArea: ${areaKm2.toFixed(3)} km² (${dims.widthKm.toFixed(3)}km x ${dims.heightKm.toFixed(3)}km)\n\nView on map: ${shareUrl}${formatWarnings(warnings)}`
-                    },
-                    {
-                        type: "text",
-                        text: JSON.stringify({
-                            ...(geocodeRes ? { matched_place: geocodeRes.matched_place, alternatives: geocodeRes.alternatives } : {}),
-                            original_wgs84: bboxObj,
-                            projected: projCoords,
-                            center: {
-                                lat: centerLat,
-                                lng: centerLng
-                            },
-                            tile_indices: tileIndices,
-                            epsg,
-                            format,
-                            coord_order: coordOrder,
-                            precision,
-                            area_km2: areaKm2,
-                            dimensions: {
-                                width_km: dims.widthKm,
-                                height_km: dims.heightKm
-                            },
-                            share_url: shareUrl
-                        }, null, 2)
                     }
-                ]
+                ],
+                structuredContent: structuredData
             };
         }
 
@@ -1206,6 +2438,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const compact = args.compact as boolean || false;
             const summaryOnly = args.summary_only as boolean || false;
             const returnGeometry = args.return_geometry as boolean || false;
+            const usePolygonBoundary = args.use_polygon_boundary !== false;
             const warnings: string[] = [];
 
             if (resolution === undefined) {
@@ -1214,28 +2447,47 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
             let bboxObj: BBox;
             let geocodeRes: GeocodeResult | undefined;
+            let polygonsWithHoles: number[][][][] | null = null;
 
             if (args.location) {
                 try {
-                    geocodeRes = await geocodeLocation(args.location as string);
+                    geocodeRes = await geocodeLocation(args.location as string, usePolygonBoundary);
                     bboxObj = geocodeRes.bbox;
+                    if (usePolygonBoundary && geocodeRes.polygons_with_holes) {
+                        polygonsWithHoles = geocodeRes.polygons_with_holes;
+                    }
                 } catch (err: any) {
                     if (!args.bbox) {
                         log('error', `Geocoding failed for H3 location: ${args.location}`, { error: err.message });
                         return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
                     }
                     bboxObj = parseBBox(args.bbox as string, warnings);
+                    if (usePolygonBoundary) {
+                        polygonsWithHoles = extractPolygonsWithHolesLatLng(args.bbox as string);
+                    }
                 }
             } else if (args.bbox) {
                 bboxObj = parseBBox(args.bbox as string, warnings);
+                if (usePolygonBoundary) {
+                    polygonsWithHoles = extractPolygonsWithHolesLatLng(args.bbox as string);
+                }
             } else {
                 return { content: [{ type: "text", text: "Error: Either 'location' or 'bbox' argument must be provided." }], isError: true };
             }
 
-            const cells = getH3Cells(bboxObj, resolution, compact);
-            const shareUrl = buildShareUrl(bboxObj);
+            const cells = getH3Cells(bboxObj, resolution, compact, polygonsWithHoles);
+            const usedPolygon = !!(polygonsWithHoles && polygonsWithHoles.length > 0);
+            const shareUrl = usedPolygon && polygonsWithHoles![0]?.[0]?.length >= 3
+                ? buildShareUrlPolygon(polygonsWithHoles![0][0])
+                : buildShareUrl(bboxObj);
+            const provenance: ProvenanceMetadata = geocodeRes?.provenance || {
+                provider: "offline-h3-js",
+                data_timestamp: new Date().toISOString(),
+                cached: false,
+                cache_age_ms: 0
+            };
 
-            log('info', `get_h3_indices completed`, { resolution, compact, summary_only: summaryOnly, cell_count: cells.length });
+            log('info', `get_h3_indices completed`, { resolution, compact, summary_only: summaryOnly, cell_count: cells.length, used_polygon: usedPolygon });
 
             if (summaryOnly) {
                 const sampleCells = cells.slice(0, 10);
@@ -1243,22 +2495,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     resolution,
                     compact,
                     summary_only: true,
+                    used_polygon_boundary: usedPolygon,
                     cell_count: cells.length,
                     sample_cells: sampleCells,
                     original_bbox: bboxObj,
-                    share_url: shareUrl
+                    share_url: shareUrl,
+                    provenance,
+                    complete: false,
+                    warnings
                 };
                 return {
                     content: [
                         {
                             type: "text",
-                            text: `H3 summary: ${cells.length.toLocaleString()} cells generated at resolution ${resolution} (compacted: ${compact}).\nSample cells: ${sampleCells.join(', ')}\n\nView on map: ${shareUrl}${formatWarnings(warnings)}`
-                        },
-                        {
-                            type: "text",
-                            text: JSON.stringify(responseData, null, 2)
+                            text: `H3 summary: ${cells.length.toLocaleString()} cells generated at resolution ${resolution} (compacted: ${compact}, polygon_boundary: ${usedPolygon}).\nSample cells: ${sampleCells.join(', ')}\n\nView on map: ${shareUrl}${formatWarnings(warnings)}`
                         }
-                    ]
+                    ],
+                    structuredContent: responseData
                 };
             }
 
@@ -1266,10 +2519,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 resolution,
                 compact,
                 summary_only: false,
+                used_polygon_boundary: usedPolygon,
                 cell_count: cells.length,
                 cells,
                 original_bbox: bboxObj,
-                share_url: shareUrl
+                share_url: shareUrl,
+                provenance,
+                complete: true,
+                warnings
             };
 
             if (returnGeometry) {
@@ -1280,13 +2537,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 content: [
                     {
                         type: "text",
-                        text: `H3 cells generated: ${cells.length.toLocaleString()}\nResolution: ${resolution} | Compacted: ${compact}\n\nCells:\n${JSON.stringify(cells)}\n\nView on map: ${shareUrl}${formatWarnings(warnings)}`
-                    },
-                    {
-                        type: "text",
-                        text: JSON.stringify(responseData, null, 2)
+                        text: `H3 cells generated: ${cells.length.toLocaleString()}\nResolution: ${resolution} | Compacted: ${compact} | Polygon boundary: ${usedPolygon}\n\nCells:\n${JSON.stringify(cells)}\n\nView on map: ${shareUrl}${formatWarnings(warnings)}`
                     }
-                ]
+                ],
+                structuredContent: responseData
             };
         }
 
@@ -1304,20 +2558,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
             log('info', `generate_share_url completed`, { share_url: shareUrl });
 
+            const structuredData = {
+                bbox: bboxObj,
+                share_url: shareUrl,
+                provenance: {
+                    provider: "offline-parser",
+                    data_timestamp: new Date().toISOString(),
+                    cached: false,
+                    cache_age_ms: 0
+                },
+                complete: true,
+                warnings
+            };
+
             return {
                 content: [
                     {
                         type: "text",
                         text: `View on map: ${shareUrl}${formatWarnings(warnings)}`
-                    },
-                    {
-                        type: "text",
-                        text: JSON.stringify({
-                            bbox: bboxObj,
-                            share_url: shareUrl
-                        }, null, 2)
                     }
-                ]
+                ],
+                structuredContent: structuredData
             };
         }
 
@@ -1339,12 +2600,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     {
                         type: "text",
                         text: `Matched Location: "${result.matched_place}"\nCoordinates: (${result.center.lat.toFixed(5)}, ${result.center.lng.toFixed(5)})\nOSM Details: [${result.osm_type || 'point'}] ${result.osm_id || 'N/A'}\n\nView on map: ${result.share_url}`
-                    },
-                    {
-                        type: "text",
-                        text: JSON.stringify(result, null, 2)
                     }
-                ]
+                ],
+                structuredContent: result
             };
         }
 
@@ -1357,6 +2615,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const useAreaBoundary = args.use_area_boundary !== false;
             const radiusMeters = args.radius_meters as number | undefined;
             const returnGeometry = args.return_geometry as boolean || false;
+            const countOnly = args.count_only as boolean || false;
             const useCircle = typeof radiusMeters === 'number' && radiusMeters > 0;
 
             if (!queryRaw) {
@@ -1376,6 +2635,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             let bboxObj: BBox | undefined;
             let geocodeRes: GeocodeResult | undefined;
             let usedAreaId: number | undefined;
+            const outDirective = countOnly ? "out count;" : (returnGeometry ? "out geom;" : "out center;");
 
             if (useCircle) {
                 if (args.location) {
@@ -1398,7 +2658,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 } else {
                     return { content: [{ type: "text", text: "Error: Either 'location' or 'bbox' argument must be provided." }], isError: true };
                 }
-                const outDirective = returnGeometry ? "out geom;" : "out center;";
                 const circleFilter = `(around:${radiusMeters},${refPoint.lat},${refPoint.lng})`;
                 const formattedCore = applySpatialFilter(queryRaw, circleFilter);
                 overpassQuery = `[out:json][timeout:${timeoutSec}];\n(${formattedCore});\n${outDirective}`;
@@ -1429,7 +2688,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     return { content: [{ type: "text", text: "Error: Either 'location' or 'bbox' argument must be provided." }], isError: true };
                 }
 
-                const outDirective = returnGeometry ? "out geom;" : "out center;";
                 if (usedAreaId) {
                     const formattedCore = applySpatialFilter(queryRaw, "(area.searchArea)");
                     overpassQuery = `[out:json][timeout:${timeoutSec}];\narea(${usedAreaId})->.searchArea;\n(${formattedCore});\n${outDirective}`;
@@ -1441,56 +2699,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 }
             }
 
-            log('info', `search_overpass starting`, { query: queryRaw, mode: useCircle ? 'circle' : (usedAreaId ? 'area' : 'bbox'), radius_meters: radiusMeters, timeoutSec });
+            log('info', `search_overpass starting`, { query: queryRaw, mode: useCircle ? 'circle' : (usedAreaId ? 'area' : 'bbox'), radius_meters: radiusMeters, count_only: countOnly, timeoutSec });
 
-            const endpoints = [
-                "https://overpass-api.de/api/interpreter",
-                "https://overpass.kumi.systems/api/interpreter"
-            ];
-            if (process.env.OVERPASS_API_URL) {
-                endpoints.unshift(process.env.OVERPASS_API_URL);
+            const { data, provenance, remarkWarning } = await executeOverpassQuery(overpassQuery, timeoutSec);
+            if (remarkWarning) {
+                warnings.push(`Overpass remark: ${remarkWarning}`);
             }
 
-            let data: any = null;
-            let lastError: Error | null = null;
-            const params = new URLSearchParams();
-            params.append('data', overpassQuery);
-
-            const clientTimeoutMs = (timeoutSec + 5) * 1000;
-
-            for (const endpoint of endpoints) {
-                const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), clientTimeoutMs);
-                try {
-                    log('info', `Executing Overpass query at ${endpoint}`);
-                    const response = await fetch(endpoint, {
-                        method: "POST",
-                        body: params.toString(),
-                        headers: {
-                            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                            'Accept': 'application/json',
-                            'User-Agent': `${SERVER_NAME}/${SERVER_VERSION} (https://github.com/iamvibhorsingh/bbox-mcp-server)`
-                        },
-                        signal: controller.signal
-                    });
-                    if (!response.ok) {
-                        throw new Error(`Overpass API returned status: ${response.status} ${response.statusText}`);
-                    }
-                    data = await response.json();
-                    break;
-                } catch (err: any) {
-                    lastError = err;
-                    log('warn', `Overpass API failed at ${endpoint}`, { error: err.message });
-                } finally {
-                    clearTimeout(timeout);
-                }
-            }
-
-            if (!data) {
-                if (lastError?.name === 'AbortError') {
-                    return { content: [{ type: "text", text: `Error: Overpass API request timed out on all endpoints after ${clientTimeoutMs / 1000}s. The query or area may be too large.` }], isError: true };
-                }
-                throw new Error(`Overpass query failed on all endpoints: ${lastError?.message}`);
+            if (countOnly) {
+                const countEl = (data.elements || []).find((e: any) => e.type === "count") || data.elements?.[0] || {};
+                const tags = countEl.tags || {};
+                const counts = {
+                    nodes: parseInt(tags.nodes || "0", 10),
+                    ways: parseInt(tags.ways || "0", 10),
+                    relations: parseInt(tags.relations || "0", 10),
+                    total: parseInt(tags.total || "0", 10)
+                };
+                const shareUrl = useCircle
+                    ? buildShareUrlCircleWithMarkers(refPoint, radiusMeters!, [])
+                    : buildShareUrl(bboxObj || geocodeRes!.bbox);
+                const countData = {
+                    search_mode: useCircle ? 'circle' : (usedAreaId ? 'area' : 'bbox'),
+                    count_only: true,
+                    ...(geocodeRes ? { matched_place: geocodeRes.matched_place, alternatives: geocodeRes.alternatives } : {}),
+                    ...(usedAreaId ? { osm_area_id: usedAreaId } : {}),
+                    counts,
+                    share_url: shareUrl,
+                    provenance,
+                    complete: !remarkWarning,
+                    warnings
+                };
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Overpass fast count executed within a ${searchModeLabel}.\nTotal matching elements: ${counts.total.toLocaleString()} (nodes: ${counts.nodes.toLocaleString()}, ways: ${counts.ways.toLocaleString()}, relations: ${counts.relations.toLocaleString()})\n\nView area on map: ${shareUrl}${formatWarnings(warnings)}`
+                        }
+                    ],
+                    structuredContent: countData
+                };
             }
 
             const seenIds = new Set<string>();
@@ -1542,17 +2789,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
             const shareUrl = useCircle
                 ? buildShareUrlCircleWithMarkers(refPoint, radiusMeters!, pagedElements)
-                : buildShareUrlWithMarkers(bboxObj || geocodeRes!.bbox, pagedElements);
+                : (usedAreaId && !args.bbox && pagedElements.length > 0
+                    ? buildShareUrlMarkersOnly(pagedElements)
+                    : buildShareUrlWithMarkers(bboxObj || geocodeRes!.bbox, pagedElements));
 
             log('info', `search_overpass completed`, { total: totalCount, returned: pagedElements.length, offset, limit, truncated, mode: useCircle ? 'circle' : (usedAreaId ? 'area' : 'bbox') });
 
             const responseData: Record<string, unknown> = {
                 search_mode: useCircle ? 'circle' : (usedAreaId ? 'area' : 'bbox'),
+                count_only: false,
                 ...(geocodeRes ? { matched_place: geocodeRes.matched_place, alternatives: geocodeRes.alternatives } : {}),
                 ...(usedAreaId ? { osm_area_id: usedAreaId } : {}),
                 distance_from: refPoint,
-                generator: data.generator,
-                osm3s: data.osm3s,
+                ...(data.generator ? { generator: data.generator } : {}),
+                ...(data.osm3s ? { osm3s: data.osm3s } : {}),
                 elements: pagedElements,
                 total_count: totalCount,
                 returned_count: pagedElements.length,
@@ -1564,33 +2814,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 pagination_hint: hasMore
                     ? `Use offset=${nextOffset} to fetch the next page. Note: Each page re-queries Overpass; for large result sets, consider narrowing your query filters or bounding area instead of deep paging.`
                     : "End of result set.",
-                share_url: shareUrl
+                share_url: shareUrl,
+                provenance,
+                complete: !truncated && !remarkWarning,
+                warnings
             };
 
             const topResults = pagedElements.slice(0, 5)
                 .map((e: any) => `- [${e.type}] ${e.name} (${e.coordinates.lat.toFixed(5)}, ${e.coordinates.lon.toFixed(5)}) — ${e.distance_meters}m away`)
                 .join('\n');
-            const moreNote = pagedElements.length > 5 ? `\n  … and ${pagedElements.length - 5} more on this page (see JSON)` : '';
+            const moreNote = pagedElements.length > 5 ? `\n  … and ${pagedElements.length - 5} more on this page` : '';
 
             return {
                 content: [
                     {
                         type: "text",
                         text: `Overpass query executed within a ${searchModeLabel}.\nFound ${totalCount} element${totalCount !== 1 ? 's' : ''}${totalCount > limit ? ` (showing items ${offset + 1}-${offset + pagedElements.length} of ${totalCount})` : ''}.\nDistance measured from: ${refPoint.description}\n\nTop results:\n${topResults}${moreNote}\n\nView on map: ${shareUrl}${formatWarnings(warnings)}`
-                    },
-                    {
-                        type: "text",
-                        text: JSON.stringify(responseData, null, 2)
                     }
-                ]
+                ],
+                structuredContent: responseData
             };
         }
 
         else if (toolName === "list_osm_tags") {
             const args = request.params.arguments || {};
             const category = (args.category as string || "").toLowerCase().trim();
+            const warnings: string[] = [];
 
             let recommendations = "";
+            let source: "built-in" | "taginfo" = "built-in";
+            let tags: string[] = [];
+            let provenance: ProvenanceMetadata = {
+                provider: "built-in-osm-tag-index",
+                data_timestamp: new Date().toISOString(),
+                cached: true,
+                cache_age_ms: 0
+            };
+
             switch (true) {
                 case category.includes('food') || category.includes('restaurant') || category.includes('cafe') || category.includes('pizza') || category.includes('dining'):
                     recommendations = `Restaurants: nwr["amenity"="restaurant"]\nFast Food: nwr["amenity"="fast_food"]\nCafes: nwr["amenity"="cafe"]\nBars: nwr["amenity"="bar"]\nPubs: nwr["amenity"="pub"]\nIce Cream: nwr["amenity"="ice_cream"]\nCoffee Shops: nwr["shop"="coffee"]\nBakeries: nwr["shop"="bakery"]`;
@@ -1643,17 +2903,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 case category.includes('childcare') || category.includes('daycare') || category.includes('child'):
                     recommendations = `Childcare/Daycare: nwr["amenity"="childcare"]\nPlaygrounds: nwr["leisure"="playground"]`;
                     break;
-                default:
+                default: {
                     log('info', `Category '${category}' not in index, querying Taginfo API`);
-                    recommendations = await getTaginfoSuggestions(category);
+                    source = "taginfo";
+                    const taginfoRes = await getTaginfoSuggestions(category);
+                    recommendations = taginfoRes.text;
+                    tags = taginfoRes.tags;
+                    if (taginfoRes.warning) warnings.push(taginfoRes.warning);
+                    provenance = {
+                        provider: "taginfo (https://taginfo.openstreetmap.org)",
+                        attribution: OSM_ATTRIBUTION,
+                        data_timestamp: taginfoRes.timestamp,
+                        cached: taginfoRes.cached,
+                        cache_age_ms: taginfoRes.cache_age_ms
+                    };
                     break;
+                }
+            }
+
+            if (source === "built-in") {
+                const matches = recommendations.match(/(?:nwr|node|way|relation)\[[^\n;]+/g);
+                tags = matches ? matches.map(m => m.trim()) : [];
             }
 
             return {
                 content: [{
                     type: "text",
                     text: `OSM Tag Recommendations for '${category}':\n\n${recommendations}\n\nTip: You can use these tag selectors directly in the 'query' argument of search_overpass.`
-                }]
+                }],
+                structuredContent: {
+                    category,
+                    source,
+                    tags,
+                    recommendations_text: recommendations,
+                    provenance,
+                    complete: warnings.length === 0,
+                    warnings
+                }
             };
         }
 
@@ -1663,10 +2949,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const resolution = (args.resolution as number) ?? 8;
             const timeoutSec = (args.timeout_seconds as number) || 25;
             const useAreaBoundary = args.use_area_boundary !== false;
+            const radiusMeters = args.radius_meters as number | undefined;
+            const useCircle = typeof radiusMeters === 'number' && radiusMeters > 0;
             const warnings: string[] = [];
 
             if (!queryRaw) {
                 return { content: [{ type: "text", text: "Error: 'query' is required." }], isError: true };
+            }
+            if (queryRaw.length > 2000) {
+                return { content: [{ type: "text", text: "Error: Query is too long (maximum 2000 characters)." }], isError: true };
+            }
+            if (queryRaw.includes("[out:") || queryRaw.includes("[timeout:") || queryRaw.includes("[bbox:")) {
+                return { content: [{ type: "text", text: "Error: Query must not contain [out:], [timeout:], or [bbox:] directives." }], isError: true };
             }
 
             if (resolution < 0 || resolution > 15 || !Number.isInteger(resolution)) {
@@ -1696,10 +2990,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 return { content: [{ type: "text", text: "Error: Either 'location' or 'bbox' argument must be provided." }], isError: true };
             }
 
-            log('info', `aggregate_overpass_h3 starting`, { query: queryRaw, resolution, timeoutSec, mode: usedAreaId ? 'area' : 'bbox' });
+            log('info', `aggregate_overpass_h3 starting`, { query: queryRaw, resolution, timeoutSec, mode: useCircle ? 'circle' : (usedAreaId ? 'area' : 'bbox') });
 
             let overpassQuery: string;
-            if (usedAreaId) {
+            const centerPt = geocodeRes?.center || { lat: (bboxObj.lat1 + bboxObj.lat2) / 2, lng: (bboxObj.lng1 + bboxObj.lng2) / 2 };
+
+            if (useCircle) {
+                const circleFilter = `(around:${radiusMeters},${centerPt.lat},${centerPt.lng})`;
+                const formattedCore = applySpatialFilter(queryRaw, circleFilter);
+                overpassQuery = `[out:json][timeout:${timeoutSec}];\n(${formattedCore});\nout center;`;
+            } else if (usedAreaId) {
                 const formattedCore = applySpatialFilter(queryRaw, "(area.searchArea)");
                 overpassQuery = `[out:json][timeout:${timeoutSec}];\narea(${usedAreaId})->.searchArea;\n(${formattedCore});\nout center;`;
             } else {
@@ -1707,50 +3007,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 overpassQuery = `[out:json][timeout:${timeoutSec}][bbox:${bboxObj.lat1},${bboxObj.lng1},${bboxObj.lat2},${bboxObj.lng2}];\n(${formattedCore});\nout center;`;
             }
 
-            let data: any = null;
-            let lastError: Error | null = null;
-            const params = new URLSearchParams();
-            params.append('data', overpassQuery);
-
-            const endpoints = [
-                "https://overpass-api.de/api/interpreter",
-                "https://overpass.kumi.systems/api/interpreter"
-            ];
-
-            if (process.env.OVERPASS_API_URL) {
-                endpoints.unshift(process.env.OVERPASS_API_URL);
+            let execResult: OverpassExecutionResult;
+            try {
+                execResult = await executeOverpassQuery(overpassQuery, timeoutSec);
+            } catch (err: any) {
+                return { content: [{ type: "text", text: `Error: Overpass query failed: ${err.message}` }], isError: true };
             }
 
-            const clientTimeoutMs = (timeoutSec + 5) * 1000;
-
-            for (const endpoint of endpoints) {
-                const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), clientTimeoutMs);
-
-                try {
-                    const response = await fetch(endpoint, {
-                        method: "POST",
-                        body: params.toString(),
-                        headers: {
-                            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                            'Accept': 'application/json',
-                            'User-Agent': `${SERVER_NAME}/${SERVER_VERSION} (https://github.com/iamvibhorsingh/bbox-mcp-server)`
-                        },
-                        signal: controller.signal
-                    });
-
-                    if (!response.ok) throw new Error(`Status: ${response.status}`);
-                    data = await response.json();
-                    break;
-                } catch (err: any) {
-                    lastError = err;
-                } finally {
-                    clearTimeout(timeout);
-                }
-            }
-
-            if (!data) {
-                return { content: [{ type: "text", text: `Error: Overpass query failed: ${lastError?.message}` }], isError: true };
+            const { data, provenance, remarkWarning } = execResult;
+            if (remarkWarning) {
+                warnings.push(`Overpass remark: ${remarkWarning}`);
             }
 
             let rawElements = data.elements || [];
@@ -1779,9 +3045,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 }
             });
 
-            const shareUrl = buildShareUrl(bboxObj);
             const totalGrouped = Object.values(hexCounts).reduce((a, b) => a + b, 0);
-
             const activeHexes = Object.keys(hexCounts);
             const geojson = h3CellsToGeoJSON(activeHexes);
 
@@ -1790,6 +3054,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 f.properties.count = hexCounts[cellId];
                 f.properties.elements = hexElements[cellId];
             });
+
+            const topHexes = Object.entries(hexCounts)
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 10);
+
+            // Plot the top hex hotspot centroids as pins on the verification map!
+            const hotspotMarkers = topHexes.map(([hex, count], idx) => {
+                const [lat, lon] = h3.cellToLatLng(hex);
+                return {
+                    coordinates: { lat, lon },
+                    name: `#${idx + 1} (${count} items)`
+                };
+            });
+
+            const shareUrl = useCircle
+                ? buildShareUrlCircleWithMarkers(centerPt, radiusMeters!, hotspotMarkers)
+                : (hotspotMarkers.length > 0
+                    ? (usedAreaId && !args.bbox
+                        ? buildShareUrlMarkersOnly(hotspotMarkers)
+                        : buildShareUrlWithMarkers(bboxObj, hotspotMarkers))
+                    : buildShareUrl(bboxObj));
 
             log('info', `aggregate_overpass_h3 completed`, { resolution, elements: totalGrouped, activeHexes: activeHexes.length });
 
@@ -1802,25 +3087,661 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 hex_counts: hexCounts,
                 hex_geojson: geojson,
                 original_bbox: bboxObj,
-                share_url: shareUrl
+                share_url: shareUrl,
+                provenance,
+                complete: !remarkWarning,
+                warnings
             };
-
-            const topHexes = Object.entries(hexCounts)
-                .sort((a, b) => b[1] - a[1])
-                .slice(0, 10);
 
             return {
                 content: [
                     {
                         type: "text",
                         text: `Aggregated ${totalGrouped} element${totalGrouped !== 1 ? 's' : ''} into ${activeHexes.length} H3 hexagon${activeHexes.length !== 1 ? 's' : ''} at resolution ${resolution}.\n\nTop hexagons by density:\n${topHexes.map(([hex, count]) => `- ${hex}: ${count} element${count !== 1 ? 's' : ''}`).join('\n')}\n\nView on map: ${shareUrl}${formatWarnings(warnings)}`
+                    }
+                ],
+                structuredContent: responseData
+            };
+        }
+
+        else if (toolName === "calculate_route") {
+            const args = request.params.arguments || {};
+            const originInput = (args.origin as string || "").trim();
+            const destInput = (args.destination as string || "").trim();
+            const profile = (args.profile as "driving" | "walking" | "cycling") || "driving";
+            const returnSteps = args.return_steps as boolean || false;
+            const warnings: string[] = [];
+
+            if (!originInput || !destInput) {
+                return { content: [{ type: "text", text: "Error: Both 'origin' and 'destination' are required." }], isError: true };
+            }
+
+            async function resolveEndpoint(input: string): Promise<{ lat: number; lng: number; label: string }> {
+                const coordMatch = input.match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/);
+                if (coordMatch) {
+                    const p0 = parseFloat(coordMatch[1]);
+                    const p1 = parseFloat(coordMatch[2]);
+                    if (validateBBox(p0, p1, p0, p1)) {
+                        return { lat: p0, lng: p1, label: `(${p0.toFixed(5)}, ${p1.toFixed(5)})` };
+                    } else if (validateBBox(p1, p0, p1, p0)) {
+                        warnings.push(`Endpoint '${input}' interpreted as lng,lat -> converted to lat=${p1}, lng=${p0}.`);
+                        return { lat: p1, lng: p0, label: `(${p1.toFixed(5)}, ${p0.toFixed(5)})` };
+                    }
+                }
+                const geo = await geocodeLocation(input);
+                return { lat: geo.center.lat, lng: geo.center.lng, label: geo.matched_place };
+            }
+
+            const start = await resolveEndpoint(originInput);
+            const end = await resolveEndpoint(destInput);
+
+            const straightLineMeters = calculateHaversineDistanceMeters(start.lat, start.lng, end.lat, end.lng);
+            const bearing = calculateBearingDegrees(start.lat, start.lng, end.lat, end.lng);
+
+            // OSRM public servers (FOSSGIS Germany regional profiles + OSRM main demo)
+            const osrmProfileMap: Record<string, { fossgis: string; main: string }> = {
+                driving: { fossgis: "routed-car/route/v1/driving", main: "route/v1/driving" },
+                walking: { fossgis: "routed-foot/route/v1/driving", main: "route/v1/foot" },
+                cycling: { fossgis: "routed-bike/route/v1/driving", main: "route/v1/bike" }
+            };
+            const prof = osrmProfileMap[profile] || osrmProfileMap.driving;
+            const coordsPair = `${start.lng.toFixed(6)},${start.lat.toFixed(6)};${end.lng.toFixed(6)},${end.lat.toFixed(6)}`;
+            const queryParams = `?overview=full&geometries=geojson&steps=${returnSteps ? 'true' : 'false'}`;
+            const routeCacheKey = `${profile}:${coordsPair}:${returnSteps}`;
+
+            let routeData: any = null;
+            let usedProvider = "";
+            let cachedRoute = false;
+            let cacheAgeMs = 0;
+            let dataTimestamp = new Date().toISOString();
+
+            const cachedEntry = ROUTE_CACHE.get(routeCacheKey);
+            if (cachedEntry && (Date.now() - cachedEntry.timestamp < ROUTE_CACHE_TTL_MS)) {
+                routeData = cachedEntry.data;
+                usedProvider = cachedEntry.provider;
+                cachedRoute = true;
+                cacheAgeMs = Date.now() - cachedEntry.timestamp;
+                dataTimestamp = new Date(cachedEntry.timestamp).toISOString();
+            } else {
+                const routingUrls: Array<{ url: string; provider: string }> = [
+                    {
+                        url: `https://routing.openstreetmap.de/${prof.fossgis}/${coordsPair}${queryParams}`,
+                        provider: "fossgis-osrm (https://routing.openstreetmap.de)"
                     },
                     {
-                        type: "text",
-                        text: JSON.stringify(responseData, null, 2)
+                        url: `https://router.project-osrm.org/${prof.main}/${coordsPair}${queryParams}`,
+                        provider: "project-osrm-demo (https://router.project-osrm.org)"
                     }
-                ]
+                ];
+                if (process.env.OSRM_API_URL) {
+                    const customBase = process.env.OSRM_API_URL.replace(/\/+$/, "");
+                    routingUrls.unshift({
+                        url: `${customBase}/${prof.main}/${coordsPair}${queryParams}`,
+                        provider: `custom-osrm (${customBase})`
+                    });
+                }
+
+                let lastRouteErr: Error | null = null;
+
+                for (const candidate of routingUrls) {
+                    await routingRateLimit();
+                    const controller = new AbortController();
+                    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+                    try {
+                        const res = await fetch(candidate.url, {
+                            headers: {
+                                'User-Agent': APP_USER_AGENT,
+                                'Accept': 'application/json'
+                            },
+                            signal: controller.signal
+                        });
+                        if (!res.ok) throw new Error(`Status ${res.status}`);
+                        const json = await res.json();
+                        if (json.code === "Ok" && Array.isArray(json.routes) && json.routes.length > 0) {
+                            routeData = json.routes[0];
+                            usedProvider = candidate.provider;
+                            const now = Date.now();
+                            dataTimestamp = new Date(now).toISOString();
+                            ROUTE_CACHE.set(routeCacheKey, { timestamp: now, data: routeData, provider: usedProvider });
+                            break;
+                        }
+                        throw new Error(json.message || `Routing returned code ${json.code}`);
+                    } catch (err: any) {
+                        lastRouteErr = err;
+                        log('warn', `OSRM routing failed at ${candidate.url}`, { error: err.message });
+                    } finally {
+                        clearTimeout(timeout);
+                    }
+                }
+
+                if (!routeData) {
+                    return {
+                        content: [{ type: "text", text: `Error: Route calculation failed on all configured OSRM servers: ${lastRouteErr?.message}` }],
+                        isError: true
+                    };
+                }
+            }
+
+            const distanceMeters = Math.round(routeData.distance * 10) / 10;
+            const durationSeconds = Math.round(routeData.duration);
+            const durationMinutes = Math.round((durationSeconds / 60) * 10) / 10;
+            const detourFactor = straightLineMeters > 0 ? Math.round((distanceMeters / straightLineMeters) * 100) / 100 : 1;
+
+            // Extract actual route LineString geometry and compute route bounding box
+            const geomCoords: number[][] = (routeData.geometry?.coordinates && routeData.geometry.coordinates.length >= 2)
+                ? routeData.geometry.coordinates
+                : [[start.lng, start.lat], [end.lng, end.lat]];
+            const routeGeometry = {
+                type: "LineString" as const,
+                coordinates: geomCoords
             };
+            const lats = geomCoords.map(c => c[1]);
+            const lngs = geomCoords.map(c => c[0]);
+            const routeBBox = ensureValidBBox(safeMin(lats), safeMin(lngs), safeMax(lats), safeMax(lngs));
+
+            const midIdx = Math.floor(geomCoords.length / 2);
+            const midPt = geomCoords[midIdx] || [(start.lng + end.lng) / 2, (start.lat + end.lat) / 2];
+
+            const markers = [
+                { coordinates: { lat: start.lat, lon: start.lng }, name: `Origin: ${start.label}` },
+                { coordinates: { lat: midPt[1], lon: midPt[0] }, name: `Route (${(distanceMeters / 1000).toFixed(1)}km, ${durationMinutes}min)` },
+                { coordinates: { lat: end.lat, lon: end.lng }, name: `Dest: ${end.label}` }
+            ];
+            const shareUrl = buildShareUrlWithRoute(routeBBox, geomCoords, markers);
+
+            const steps = returnSteps && routeData.legs?.[0]?.steps
+                ? routeData.legs[0].steps.map((s: any) => ({
+                    name: s.name || "unnamed road",
+                    distance_meters: Math.round(s.distance),
+                    duration_seconds: Math.round(s.duration),
+                    ...(s.maneuver?.type ? { maneuver: `${s.maneuver.type}${s.maneuver.modifier ? ' ' + s.maneuver.modifier : ''}` } : {})
+                }))
+                : undefined;
+
+            const provenance: ProvenanceMetadata = {
+                provider: usedProvider,
+                attribution: OSM_ATTRIBUTION,
+                data_timestamp: dataTimestamp,
+                cached: cachedRoute,
+                cache_age_ms: cacheAgeMs,
+                usage_policy: "https://routing.openstreetmap.de/about.html (Max 1 req/s, no heavy/bulk usage; configure OSRM_API_URL for production workloads)"
+            };
+
+            const resultPayload = {
+                profile,
+                origin: start,
+                destination: end,
+                distance_meters: distanceMeters,
+                distance_km: Math.round((distanceMeters / 1000) * 100) / 100,
+                duration_seconds: durationSeconds,
+                duration_minutes: durationMinutes,
+                straight_line_meters: Math.round(straightLineMeters * 10) / 10,
+                detour_factor: detourFactor,
+                initial_bearing: bearing,
+                route_bbox: routeBBox,
+                route_geometry: routeGeometry,
+                ...(steps ? { steps } : {}),
+                share_url: shareUrl,
+                provenance,
+                complete: true,
+                warnings
+            };
+
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `Route (${profile}): ${start.label} → ${end.label}\nDistance: ${(distanceMeters / 1000).toFixed(2)} km (${distanceMeters.toLocaleString()} m) | Straight-line: ${(straightLineMeters / 1000).toFixed(2)} km (detour factor: ${detourFactor}x)\nEstimated Duration: ${durationMinutes} min (${durationSeconds} s)\nInitial Bearing: ${bearing.degrees}° (${bearing.cardinal})\nGeometry: LineString (${geomCoords.length} vertices)\n\nView route on map: ${shareUrl}${formatWarnings(warnings)}`
+                    }
+                ],
+                structuredContent: resultPayload
+            };
+        }
+
+        else if (toolName === "get_elevation") {
+            const args = request.params.arguments || {};
+            const warnings: string[] = [];
+            let queryPoints: Array<{ lat: number; lng: number; label: string }> = [];
+            let bboxObj: BBox | undefined;
+            let geocodeRes: GeocodeResult | undefined;
+            let mode: "points" | "grid" = "points";
+
+            if (Array.isArray(args.points) && args.points.length > 0) {
+                if (args.points.length > 100) {
+                    return { content: [{ type: "text", text: "Error: Maximum 100 points allowed per call." }], isError: true };
+                }
+                queryPoints = args.points.map((p: any, i: number) => {
+                    const lat = Number(p.lat);
+                    const lng = Number(p.lng);
+                    if (!validateBBox(lat, lng, lat, lng)) {
+                        throw new Error(`Invalid coordinates at index ${i}: (${lat}, ${lng})`);
+                    }
+                    return { lat, lng, label: p.label || `Point ${i + 1}` };
+                });
+                const lats = queryPoints.map(p => p.lat);
+                const lngs = queryPoints.map(p => p.lng);
+                bboxObj = ensureValidBBox(safeMin(lats), safeMin(lngs), safeMax(lats), safeMax(lngs));
+            } else {
+                const locStr = typeof args.location === 'string' ? args.location.trim() : '';
+                const coordMatch = locStr.match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/);
+                if (coordMatch) {
+                    const p0 = parseFloat(coordMatch[1]);
+                    const p1 = parseFloat(coordMatch[2]);
+                    if (validateBBox(p0, p1, p0, p1)) {
+                        bboxObj = { lat1: p0, lng1: p1, lat2: p0, lng2: p1 };
+                    } else if (validateBBox(p1, p0, p1, p0)) {
+                        warnings.push(`Coordinate '${locStr}' interpreted as lng,lat -> converted to lat=${p1}, lng=${p0}.`);
+                        bboxObj = { lat1: p1, lng1: p0, lat2: p1, lng2: p0 };
+                    } else {
+                        geocodeRes = await geocodeLocation(locStr);
+                        bboxObj = geocodeRes.bbox;
+                    }
+                } else if (args.location) {
+                    geocodeRes = await geocodeLocation(locStr);
+                    bboxObj = geocodeRes.bbox;
+                } else if (args.bbox) {
+                    bboxObj = parseBBox(args.bbox as string, warnings);
+                } else {
+                    return { content: [{ type: "text", text: "Error: Provide either 'points', 'location', or 'bbox'." }], isError: true };
+                }
+
+                const isSinglePoint = Math.abs(bboxObj.lat2 - bboxObj.lat1) < 1e-6 && Math.abs(bboxObj.lng2 - bboxObj.lng1) < 1e-6;
+                if (isSinglePoint) {
+                    queryPoints = [{ lat: bboxObj.lat1, lng: bboxObj.lng1, label: geocodeRes?.matched_place || "Point" }];
+                } else {
+                    mode = "grid";
+                    const gridSize = Math.max(2, Math.min(10, Math.round((args.grid_size as number) ?? 5)));
+                    warnings.push(`Grid mode samples a finite ${gridSize}x${gridSize} point grid (${gridSize * gridSize} points) over a 90m resolution DEM (Copernicus DEM GLO-90). Sample statistics do not guarantee true area-wide minimum, maximum, or slope measurements.`);
+                    for (let r = 0; r < gridSize; r++) {
+                        const lat = bboxObj.lat1 + (bboxObj.lat2 - bboxObj.lat1) * (r / (gridSize - 1));
+                        for (let c = 0; c < gridSize; c++) {
+                            const lng = bboxObj.lng1 + (bboxObj.lng2 - bboxObj.lng1) * (c / (gridSize - 1));
+                            queryPoints.push({ lat, lng, label: `Grid (${r + 1},${c + 1})` });
+                        }
+                    }
+                }
+            }
+
+            const latsParam = queryPoints.map(p => p.lat.toFixed(6)).join(",");
+            const lngsParam = queryPoints.map(p => p.lng.toFixed(6)).join(",");
+            const elevationBase = (process.env.ELEVATION_API_URL || "https://api.open-meteo.com/v1/elevation").replace(/\/+$/, "");
+            const url = `${elevationBase}?latitude=${latsParam}&longitude=${lngsParam}`;
+            const cacheKey = `${latsParam}|${lngsParam}`;
+
+            let elevations: number[] = [];
+            let cachedElev = false;
+            let cacheAgeMs = 0;
+            let dataTimestamp = new Date().toISOString();
+
+            const cachedEntry = ELEVATION_CACHE.get(cacheKey);
+            if (cachedEntry && (Date.now() - cachedEntry.timestamp < ELEVATION_CACHE_TTL_MS)) {
+                elevations = cachedEntry.elevations;
+                cachedElev = true;
+                cacheAgeMs = Date.now() - cachedEntry.timestamp;
+                dataTimestamp = new Date(cachedEntry.timestamp).toISOString();
+            } else {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+                try {
+                    const res = await fetch(url, {
+                        headers: {
+                            'User-Agent': APP_USER_AGENT,
+                            'Accept': 'application/json'
+                        },
+                        signal: controller.signal
+                    });
+                    if (!res.ok) {
+                        throw new Error(`Open-Meteo Elevation API returned status ${res.status}`);
+                    }
+                    const json = await res.json();
+                    if (!Array.isArray(json.elevation)) {
+                        throw new Error(`Unexpected response from elevation API`);
+                    }
+                    elevations = json.elevation;
+                    const now = Date.now();
+                    dataTimestamp = new Date(now).toISOString();
+                    ELEVATION_CACHE.set(cacheKey, { timestamp: now, elevations });
+                } finally {
+                    clearTimeout(timeout);
+                }
+            }
+
+            const samples = queryPoints.map((pt, idx) => ({
+                label: pt.label,
+                lat: Math.round(pt.lat * 1e6) / 1e6,
+                lng: Math.round(pt.lng * 1e6) / 1e6,
+                elevation_meters: elevations[idx] ?? null
+            })).filter((s): s is { label: string; lat: number; lng: number; elevation_meters: number } => typeof s.elevation_meters === 'number');
+
+            if (samples.length === 0) {
+                return { content: [{ type: "text", text: "Error: No elevation data returned for the requested coordinates." }], isError: true };
+            }
+
+            let minSample = samples[0];
+            let maxSample = samples[0];
+            let sum = 0;
+            for (const s of samples) {
+                if (s.elevation_meters < minSample.elevation_meters) minSample = s;
+                if (s.elevation_meters > maxSample.elevation_meters) maxSample = s;
+                sum += s.elevation_meters;
+            }
+            const meanElevation = Math.round((sum / samples.length) * 10) / 10;
+            const reliefMeters = Math.round((maxSample.elevation_meters - minSample.elevation_meters) * 10) / 10;
+
+            const markers = mode === "grid"
+                ? [
+                    { coordinates: { lat: maxSample.lat, lon: maxSample.lng }, name: `Sample High: ${maxSample.elevation_meters}m` },
+                    { coordinates: { lat: minSample.lat, lon: minSample.lng }, name: `Sample Low: ${minSample.elevation_meters}m` }
+                ]
+                : samples.map(s => ({ coordinates: { lat: s.lat, lon: s.lng }, name: `${s.label}: ${s.elevation_meters}m` }));
+
+            const displayBBox = bboxObj!.lat1 === bboxObj!.lat2 && bboxObj!.lng1 === bboxObj!.lng2
+                ? expandBBoxMeters(bboxObj!, 500)
+                : bboxObj!;
+            // Only draw a bounding box rectangle on the map in grid mode; for point lookups, show pins only
+            const shareUrl = mode === "grid"
+                ? buildShareUrlWithMarkers(displayBBox, markers)
+                : buildShareUrlMarkersOnly(markers);
+
+            const provenance: ProvenanceMetadata = {
+                provider: `open-meteo-copernicus-dem-90m (${elevationBase})`,
+                attribution: "Copernicus DEM GLO-90 via Open-Meteo (https://open-meteo.com/)",
+                data_timestamp: dataTimestamp,
+                cached: cachedElev,
+                cache_age_ms: cacheAgeMs,
+                usage_policy: "https://open-meteo.com/en/terms (Hosted API is free for non-commercial use only; commercial use requires a paid API subscription or self-hosted ELEVATION_API_URL)"
+            };
+
+            const sampleStats = {
+                min_elevation_meters: minSample.elevation_meters,
+                max_elevation_meters: maxSample.elevation_meters,
+                mean_elevation_meters: meanElevation,
+                sample_relief_meters: reliefMeters,
+                lowest_sample: minSample,
+                highest_sample: maxSample,
+                is_finite_sample: mode === "grid"
+            };
+
+            const responseData = {
+                mode,
+                ...(geocodeRes ? { matched_place: geocodeRes.matched_place } : {}),
+                dem_resolution_meters: 90,
+                sample_count: samples.length,
+                sample_stats: sampleStats,
+                samples,
+                bbox: displayBBox,
+                share_url: shareUrl,
+                provenance,
+                complete: true,
+                warnings
+            };
+
+            const summaryText = mode === "grid"
+                ? `Terrain Elevation Sample Grid (${samples.length} samples at 90m DEM resolution${geocodeRes ? ` for "${geocodeRes.matched_place}"` : ''}):\n- Sample Min: ${minSample.elevation_meters} m at (${minSample.lat}, ${minSample.lng})\n- Sample Max: ${maxSample.elevation_meters} m at (${maxSample.lat}, ${maxSample.lng})\n- Sample Mean: ${meanElevation} m | Sample Relief: ${reliefMeters} m`
+                : `Point Elevations (${samples.length}, 90m Copernicus DEM):\n` + samples.map(s => `- ${s.label} (${s.lat}, ${s.lng}): ${s.elevation_meters} m`).join('\n');
+
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `${summaryText}\n\nView on map: ${shareUrl}${formatWarnings(warnings)}`
+                    }
+                ],
+                structuredContent: responseData
+            };
+        }
+
+        else if (toolName === "spatial_calc") {
+            const args = request.params.arguments || {};
+            const operation = args.operation as string;
+            const bboxAStr = args.bbox_a as string;
+            const warnings: string[] = [];
+
+            if (!operation || !bboxAStr) {
+                return { content: [{ type: "text", text: "Error: 'operation' and 'bbox_a' are required." }], isError: true };
+            }
+
+            const provenance: ProvenanceMetadata = {
+                provider: "offline-geometry-engine",
+                data_timestamp: new Date().toISOString(),
+                cached: false,
+                cache_age_ms: 0
+            };
+
+            if (operation === "relation") {
+                const bboxBStr = args.bbox_b as string;
+                if (!bboxBStr) {
+                    return { content: [{ type: "text", text: "Error: 'bbox_b' is required for operation='relation'." }], isError: true };
+                }
+                const a = parseBBox(bboxAStr, warnings);
+                const b = parseBBox(bboxBStr, warnings);
+
+                const intersects = !(b.lng1 > a.lng2 || b.lng2 < a.lng1 || b.lat1 > a.lat2 || b.lat2 < a.lat1);
+                const aContainsB = a.lat1 <= b.lat1 && a.lat2 >= b.lat2 && a.lng1 <= b.lng1 && a.lng2 >= b.lng2;
+                const bContainsA = b.lat1 <= a.lat1 && b.lat2 >= a.lat2 && b.lng1 <= a.lng1 && b.lng2 >= a.lng2;
+
+                const unionBBox: BBox = {
+                    lat1: Math.min(a.lat1, b.lat1),
+                    lng1: Math.min(a.lng1, b.lng1),
+                    lat2: Math.max(a.lat2, b.lat2),
+                    lng2: Math.max(a.lng2, b.lng2)
+                };
+
+                let intersectionBBox: BBox | null = null;
+                let intersectionAreaKm2 = 0;
+                if (intersects) {
+                    intersectionBBox = {
+                        lat1: Math.max(a.lat1, b.lat1),
+                        lng1: Math.max(a.lng1, b.lng1),
+                        lat2: Math.min(a.lat2, b.lat2),
+                        lng2: Math.min(a.lng2, b.lng2)
+                    };
+                    intersectionAreaKm2 = calculateBboxArea(intersectionBBox);
+                }
+
+                const areaAKm2 = calculateBboxArea(a);
+                const areaBKm2 = calculateBboxArea(b);
+                const unionAreaKm2 = calculateBboxArea(unionBBox);
+                const overlapPctOfA = areaAKm2 > 0 ? Math.round((intersectionAreaKm2 / areaAKm2) * 10000) / 100 : 0;
+                const overlapPctOfB = areaBKm2 > 0 ? Math.round((intersectionAreaKm2 / areaBKm2) * 10000) / 100 : 0;
+
+                const centroidDistanceMeters = calculateHaversineDistanceMeters(
+                    (a.lat1 + a.lat2) / 2, (a.lng1 + a.lng2) / 2,
+                    (b.lat1 + b.lat2) / 2, (b.lng1 + b.lng2) / 2
+                );
+
+                const shareUrl = buildShareUrl(intersectionBBox || unionBBox);
+                const payload = {
+                    operation: "relation",
+                    intersects,
+                    a_contains_b: aContainsB,
+                    b_contains_a: bContainsA,
+                    area_a_km2: Math.round(areaAKm2 * 1000) / 1000,
+                    area_b_km2: Math.round(areaBKm2 * 1000) / 1000,
+                    intersection_area_km2: Math.round(intersectionAreaKm2 * 1000) / 1000,
+                    union_area_km2: Math.round(unionAreaKm2 * 1000) / 1000,
+                    overlap_percent_of_a: overlapPctOfA,
+                    overlap_percent_of_b: overlapPctOfB,
+                    centroid_distance_meters: Math.round(centroidDistanceMeters * 10) / 10,
+                    intersection_bbox: intersectionBBox,
+                    union_bbox: unionBBox,
+                    share_url: shareUrl,
+                    provenance,
+                    complete: true,
+                    warnings
+                };
+
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Spatial Relation:\n- Intersects: ${intersects} | A contains B: ${aContainsB} | B contains A: ${bContainsA}\n- Intersection Area: ${payload.intersection_area_km2} km² (${overlapPctOfA}% of A, ${overlapPctOfB}% of B)\n- Centroid Distance: ${payload.centroid_distance_meters} m\n\nView on map: ${shareUrl}${formatWarnings(warnings)}`
+                        }
+                    ],
+                    structuredContent: payload
+                };
+            }
+
+            else if (operation === "point_in_geometry") {
+                const ptStr = args.point as string;
+                if (!ptStr) {
+                    return { content: [{ type: "text", text: "Error: 'point' ('lat,lng') is required for operation='point_in_geometry'." }], isError: true };
+                }
+                const ptBbox = parseBBox(ptStr, warnings);
+                const ptLat = (ptBbox.lat1 + ptBbox.lat2) / 2;
+                const ptLng = (ptBbox.lng1 + ptBbox.lng2) / 2;
+
+                const targetBBox = parseBBox(bboxAStr, warnings);
+                const insideBBox = ptLat >= targetBBox.lat1 && ptLat <= targetBBox.lat2 && ptLng >= targetBBox.lng1 && ptLng <= targetBBox.lng2;
+
+                const polygonsWithHoles = extractPolygonsWithHolesLatLng(bboxAStr);
+                let insidePolygon: boolean | undefined;
+                if (polygonsWithHoles && polygonsWithHoles.length > 0) {
+                    insidePolygon = polygonsWithHoles.some(polyRings => isPointInPolygonWithHoles(ptLat, ptLng, polyRings));
+                }
+
+                const isInside = insidePolygon !== undefined ? insidePolygon : insideBBox;
+                const ptMarker = [{ coordinates: { lat: ptLat, lon: ptLng }, name: isInside ? "Inside" : "Outside" }];
+                const shareUrl = polygonsWithHoles && polygonsWithHoles[0]?.[0]?.length >= 3
+                    ? buildShareUrlPolygon(polygonsWithHoles[0][0], ptMarker)
+                    : buildShareUrlWithMarkers(targetBBox, ptMarker);
+
+                const payload = {
+                    operation: "point_in_geometry",
+                    point: { lat: ptLat, lng: ptLng },
+                    inside: isInside,
+                    inside_bbox: insideBBox,
+                    ...(insidePolygon !== undefined ? { inside_polygon: insidePolygon } : {}),
+                    target_bbox: targetBBox,
+                    share_url: shareUrl,
+                    provenance,
+                    complete: true,
+                    warnings
+                };
+
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Point (${ptLat}, ${ptLng}) is ${isInside ? "INSIDE" : "OUTSIDE"} the target geometry (inside_bbox: ${insideBBox}${insidePolygon !== undefined ? `, inside_polygon: ${insidePolygon}` : ''}).\n\nView on map: ${shareUrl}${formatWarnings(warnings)}`
+                        }
+                    ],
+                    structuredContent: payload
+                };
+            }
+
+            else if (operation === "distance_bearing") {
+                const bboxBStr = args.bbox_b as string || args.point as string;
+                if (!bboxBStr) {
+                    return { content: [{ type: "text", text: "Error: 'bbox_b' (or 'point') is required as the destination for operation='distance_bearing'." }], isError: true };
+                }
+                const a = parseBBox(bboxAStr, warnings);
+                const b = parseBBox(bboxBStr, warnings);
+                const lat1 = (a.lat1 + a.lat2) / 2, lng1 = (a.lng1 + a.lng2) / 2;
+                const lat2 = (b.lat1 + b.lat2) / 2, lng2 = (b.lng1 + b.lng2) / 2;
+
+                const distMeters = calculateHaversineDistanceMeters(lat1, lng1, lat2, lng2);
+                const bearing = calculateBearingDegrees(lat1, lng1, lat2, lng2);
+                const midpoint = {
+                    lat: Math.round(((lat1 + lat2) / 2) * 1e6) / 1e6,
+                    lng: Math.round(((lng1 + lng2) / 2) * 1e6) / 1e6
+                };
+
+                const combinedBBox = ensureValidBBox(Math.min(lat1, lat2), Math.min(lng1, lng2), Math.max(lat1, lat2), Math.max(lng1, lng2));
+                const lineTrace = `PB:${lat1.toFixed(5)},${lng1.toFixed(5)},${lat2.toFixed(5)},${lng2.toFixed(5)},${lat1.toFixed(5)},${lng1.toFixed(5)}`;
+                const shareUrl = buildShareUrlMarkersOnly(
+                    [
+                        { coordinates: { lat: lat1, lon: lng1 }, name: "Point A" },
+                        { coordinates: { lat: midpoint.lat, lon: midpoint.lng }, name: `Midpoint (${(distMeters / 1000).toFixed(2)}km)` },
+                        { coordinates: { lat: lat2, lon: lng2 }, name: "Point B" }
+                    ],
+                    [lineTrace]
+                );
+
+                const payload = {
+                    operation: "distance_bearing",
+                    from: { lat: lat1, lng: lng1 },
+                    to: { lat: lat2, lng: lng2 },
+                    distance_meters: Math.round(distMeters * 10) / 10,
+                    distance_km: Math.round((distMeters / 1000) * 1000) / 1000,
+                    bearing_degrees: bearing.degrees,
+                    cardinal_direction: bearing.cardinal,
+                    midpoint,
+                    bbox: combinedBBox,
+                    share_url: shareUrl,
+                    provenance,
+                    complete: true,
+                    warnings
+                };
+
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Distance & Bearing: (${lat1}, ${lng1}) → (${lat2}, ${lng2})\n- Distance: ${payload.distance_km} km (${payload.distance_meters} m)\n- Initial Bearing: ${bearing.degrees}° (${bearing.cardinal})\n- Midpoint: (${midpoint.lat}, ${midpoint.lng})\n\nView on map: ${shareUrl}${formatWarnings(warnings)}`
+                        }
+                    ],
+                    structuredContent: payload
+                };
+            }
+
+            else if (operation === "split_grid") {
+                const rows = Math.max(1, Math.min(20, Math.round((args.rows as number) ?? 2)));
+                const cols = Math.max(1, Math.min(20, Math.round((args.cols as number) ?? 2)));
+                const bbox = parseBBox(bboxAStr, warnings);
+
+                const dLat = (bbox.lat2 - bbox.lat1) / rows;
+                const dLng = (bbox.lng2 - bbox.lng1) / cols;
+                const cells: Array<{ row: number; col: number; bbox: BBox; csv: string }> = [];
+
+                for (let r = 0; r < rows; r++) {
+                    for (let c = 0; c < cols; c++) {
+                        const cellBBox: BBox = {
+                            lat1: Math.round((bbox.lat1 + r * dLat) * 1e6) / 1e6,
+                            lng1: Math.round((bbox.lng1 + c * dLng) * 1e6) / 1e6,
+                            lat2: Math.round((bbox.lat1 + (r + 1) * dLat) * 1e6) / 1e6,
+                            lng2: Math.round((bbox.lng1 + (c + 1) * dLng) * 1e6) / 1e6
+                        };
+                        cells.push({
+                            row: r + 1,
+                            col: c + 1,
+                            bbox: cellBBox,
+                            csv: `${cellBBox.lat1},${cellBBox.lng1},${cellBBox.lat2},${cellBBox.lng2}`
+                        });
+                    }
+                }
+
+                const shareUrl = buildShareUrl(bbox);
+                const payload = {
+                    operation: "split_grid",
+                    rows,
+                    cols,
+                    total_cells: cells.length,
+                    original_bbox: bbox,
+                    cells,
+                    share_url: shareUrl,
+                    provenance,
+                    complete: true,
+                    warnings
+                };
+
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Split bounding box into ${rows}x${cols} grid (${cells.length} sub-boxes).\n\nView parent bbox on map: ${shareUrl}${formatWarnings(warnings)}`
+                        }
+                    ],
+                    structuredContent: payload
+                };
+            }
+
+            else {
+                return {
+                    content: [{ type: "text", text: `Error: Unknown spatial_calc operation '${operation}'. Supported: relation, point_in_geometry, distance_bearing, split_grid.` }],
+                    isError: true
+                };
+            }
         }
 
         else {

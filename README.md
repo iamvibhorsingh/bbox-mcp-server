@@ -1,322 +1,112 @@
 # 🌍 bbox-mcp-server
 
-**Ask AI about anything, anywhere — and verify the answer on a map. For Free**
+**FREE Geospatial tools for AI agents, with results you can inspect on a map.**
 
-The geospatial toolkit for AI agents. **6 tools, zero config** — give any LLM the ability to find, query, convert, and aggregate spatial data using open data. No API keys or signups required to start.
-
-Every response includes a shareable verification link to **[vibhorsingh.com/boundingbox](https://vibhorsingh.com/boundingbox/)** — click it to visually confirm results on an interactive map. No other MCP server does this.
+Search OpenStreetMap, convert coordinates, generate H3 grids, calculate routes, and sample terrain elevation. **10 MCP tools, no API keys required to get started.** Spatial results include shareable links to the [interactive map](https://vibhorsingh.com/boundingbox/).
 
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-green)](https://nodejs.org/) [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
+## Try asking
 
----
+- “Find cafes near Times Square.”
+- “Find me pizza near the Colosseum?”
+- “Eiffel Tower to the Louvre: walk or bike? Compare the routes.”
+- “Where are Manhattan’s coffee hotspots?”
+- “EV road trip: find chargers within 5km of Monterey.”
+- “How high up is Denver, really?”
 
-## What Can You Do With This?
+## Quick start
 
-**You don't have to be a GIS professional to make use of this.** Any AI agent with this MCP server can answer spatial questions using real OpenStreetMap data and not spit out hallucinated garbage.
+Requires **Node.js 18+**. Add this to your MCP client configuration:
 
-| Ask your AI agent... | What happens under the hood |
+```json
+{
+  "mcpServers": {
+    "bbox": {
+      "command": "npx",
+      "args": ["-y", "bbox-mcp-server"]
+    }
+  }
+}
+```
+
+| Client | Configuration file |
 |---|---|
-| *"How many EV chargers are in downtown Denver?"* | Overpass query → H3 hex binning → density analysis |
-| *"Is there a hospital near this Airbnb?"* | POI search with structured tags → map verification link |
-| *"Find all playgrounds within 1km of this address*"* | Overpass query + radius filter → pinned results on a shareable map |
-| *"Convert this WKT to GeoJSON in EPSG:3857"* | Format conversion across 6 inputs, 9 outputs, 3,900+ projections |
-| *"Show me all bike-share stations in Amsterdam"* | Curated OSM tags → Overpass query → results on map |
-| *"Compare park density across Seattle neighborhoods"* | Overpass + H3 aggregation → hex-binned spatial analysis |
+| Claude Desktop | `claude_desktop_config.json` |
+| Cursor | `.cursor/mcp.json` |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` |
+| VS Code (GitHub Copilot) | `.vscode/mcp.json` - use `servers` instead of `mcpServers` |
 
-Every answer comes with a link. Click it, see if the AI got it right and you can also share it with someone else.
+## Tools
 
----
-
-## What Makes This Different
-
-Most AI tools give you text you have to trust. This one gives you an interactive map you can check and verify!
-
-- **Verifiable** — Every response includes a public URL where you (or anyone) can visually confirm the results. This is the only MCP server that does this in any domain.
-- **Deterministic** — Queries hit real OpenStreetMap data and return real coordinates. The AI interprets your question. The data comes from all the hard work done by all the awesome OSM volunteers.
-- **Free** — No paid services. Overpass API is free, OSM data is free, the tool is free. A Mapbox token (free tier, no payment info) unlocks natural language location search but isn't required.
-- **Zero config** — `npx -y bbox-mcp-server` and you're running.
-
----
-
-## Why This Exists
-
-| The problem | How bbox-mcp solves it |
+| Tool | What it does |
 |---|---|
-| *"I have WKT but the API needs a GeoJSON bbox in EPSG:3857."* | Parses 6 input formats, projects to 3,900+ EPSG codes, outputs in 9 formats — in one call. |
-| *"I keep getting the wrong OSM tags for Overpass queries."* | `list_osm_tags` returns curated tag combos. No more hallucinated `amenity=grocery`. |
-| *"How many hospitals are in this district?"* | `aggregate_overpass_h3` queries Overpass and bins results into H3 hexagons server-side. |
-| *"Is this bounding box actually correct?"* | Every response includes a clickable map link for visual verification. |
+| `get_bounds` | Find, buffer, convert, and project bounding boxes across formats and coordinate systems. |
+| `get_h3_indices` | Generate H3 cells for a bounding box or exact polygon boundary, including holes. |
+| `generate_share_url` | Create a shareable map link for a bounding box. |
+| `reverse_geocode` | Resolve coordinates to an address and OpenStreetMap details. |
+| `search_overpass` | Find or count OSM features within an area, bounding box, or radius. |
+| `list_osm_tags` | Find OSM tags by category using curated suggestions and Taginfo fallback. |
+| `aggregate_overpass_h3` | Group OSM query results into H3 hexagons for density analysis. |
+| `calculate_route` | Get driving, walking, or cycling distance, duration, and route geometry. |
+| `get_elevation` | Get elevation for points or sample a terrain grid using the 90m Copernicus DEM. |
+| `spatial_calc` | Calculate geometry relations, point containment, distance/bearing, and grid subdivisions offline. |
 
----
+Your MCP client discovers each tool's full parameter and output schemas automatically. H3 tools use `resolution` (0–15).
 
-## Tools at a Glance
+## Inputs and outputs
 
-| Tool | What it does | Key params |
-|---|---|---|
-| `get_bounds` | Convert and project a bbox across formats and coordinate systems | `bbox`, `epsg`, `format`, `coord_order`, `zoom` |
-| `get_h3_indices` | Generate H3 hex cell indices covering a bbox | `bbox`, `resolution`, `compact` |
-| `generate_share_url` | Create a shareable map link for a bbox | `bbox` |
-| `search_overpass` | Query OpenStreetMap via Overpass QL within a bbox or radius | `bbox`, `query`, `limit`, `radius_meters` |
-| `list_osm_tags` | Look up correct OSM tags for a category | `category` |
-| `aggregate_overpass_h3` | Run an Overpass query and bin results into H3 hexagons | `bbox`, `query`, `resolution` |
+Tools with a `location` parameter accept place names. Tools with a `bbox` parameter auto-detect raw coordinates, single points, `z/x/y` tiles, WKT, GeoJSON, GeoJSON bboxes, and `ogrinfo` extents.
 
-All tools accept `location` (natural language, requires Mapbox token) or `bbox` (coordinates, WKT, GeoJSON, etc).
+**Coordinate order:** raw bboxes default to `lat1,lng1,lat2,lng2`; points use `lat,lng`. Use GeoJSON or WKT to avoid ambiguity, for example `{"bbox":[-74.006,40.712,-73.985,40.758]}` in west/south/east/north order. `coord_order` on `get_bounds` controls formatted output only.
 
----
+`get_bounds` supports 3,900+ bundled projections via `epsg` and nine output formats: `csv`, `wkt`, `geojson-bbox`, `geojson-polygon`, `leaflet`, `overpass`, `ogc-bbox`, `kml`, and `stac-bbox`.
 
-## Quick Start
+For Overpass searches, supply a selector such as `nwr["amenity"="cafe"]`; the server adds spatial filters. Set `radius_meters` for an explicit distance or omit it to search the area. Use `list_osm_tags` to find selectors by category.
 
-Add to your MCP client config:
+## Configuration
 
-<details>
-<summary><b>Claude Desktop</b> <i>(Click to expand)</i></summary>
-
-Add to `claude_desktop_config.json`:
-```json
-{
-  "mcpServers": {
-    "bbox": {
-      "command": "npx",
-      "args": ["-y", "bbox-mcp-server"]
-    }
-  }
-}
-```
-</details>
+Place search uses Nominatim with Photon fallback; a Mapbox token is optional. Defaults work without configuration.
 
 <details>
-<summary><b>Cursor</b> <i>(Click to expand)</i></summary>
+<summary>Optional environment variables</summary>
 
-Add to `.cursor/mcp.json`:
-```json
-{
-  "mcpServers": {
-    "bbox": {
-      "command": "npx",
-      "args": ["-y", "bbox-mcp-server"]
-    }
-  }
-}
-```
-</details>
+Add an `env` object alongside `command` and `args` in your server configuration.
 
-<details>
-<summary><b>Windsurf</b> <i>(Click to expand)</i></summary>
-
-Add to `~/.codeium/windsurf/mcp_config.json`:
-```json
-{
-  "mcpServers": {
-    "bbox": {
-      "command": "npx",
-      "args": ["-y", "bbox-mcp-server"]
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>VS Code (GitHub Copilot) or Google Antigravity</b> <i>(Click to expand)</i></summary>
-
-Add to `.vscode/mcp.json` in your workspace:
-```json
-{
-  "servers": {
-    "bbox": {
-      "command": "npx",
-      "args": ["-y", "bbox-mcp-server"]
-    }
-  }
-}
-```
-</details>
-
-<br/>
-
-> Try: *"Find all coffee shops within 500m of Times Square"*
-
-### Optional Configuration
-
-```json
-{
-  "mcpServers": {
-    "bbox": {
-      "command": "npx",
-      "args": ["-y", "bbox-mcp-server"],
-      "env": {
-        "MAPBOX_ACCESS_TOKEN": "pk.your-token-here",
-        "OVERPASS_API_URL": "https://your.custom.overpass.instance/api/interpreter",
-        "NOMINATIM_API_URL": "https://your.custom.nominatim.instance"
-      }
-    }
-  }
-}
-```
-
-| Variable | Default | Description |
-|---|---|---|
-| `MAPBOX_ACCESS_TOKEN` | — | Enables natural language location search (e.g. *"San Francisco"*) |
-| `OVERPASS_API_URL` | auto | Custom Overpass endpoint. By default, rotates between `overpass-api.de` and `kumi.systems`. |
-| `NOMINATIM_API_URL` | `https://nominatim.openstreetmap.org` | Custom Nominatim endpoint. Set this if hosting as a shared/remote MCP server or using a commercial provider. |
-| `MAX_H3_CELLS` | `50000` | Safety cap for H3 grid generation |
-
-*Or install globally: `npm install -g bbox-mcp-server`*
-
----
-
-## Tool Reference
-
-### `get_bounds`
-
-Convert and project a bounding box across 6 input formats, 9 output formats, and 3,900+ coordinate systems. Returns the center point and tile coordinates for the centroid.
-
-| Param | Type | Default | Description |
-|---|---|---|---|
-| `bbox` | string | — | Input geometry (coordinates, WKT, GeoJSON, ogrinfo extent) |
-| `epsg` | string | `"4326"` | Target projection. Unknown codes auto-fetched from epsg.io. |
-| `format` | string | `"csv"` | Output: `csv`, `wkt`, `geojson-bbox`, `geojson-polygon`, `leaflet`, `overpass`, `ogc-bbox`, `kml`, `stac-bbox` |
-| `coord_order` | string | `"lng,lat"` | Swap to `"lat,lng"` for APIs that expect latitude first |
-| `zoom` | number | `15` | Zoom level for tile coordinate calculation |
-| `precision` | number | `6` | Decimal places in formatted output |
-
-**💡 Prompt:** *"Get the bounding box for Central Park in WKT format projected to EPSG:32618"*
-
----
-
-### `get_h3_indices`
-
-Generate Uber H3 hexagonal cell indices covering a bounding box.
-
-| Param | Type | Default | Description |
-|---|---|---|---|
-| `bbox` | string | — | Input geometry |
-| `resolution` | number | — | H3 resolution (0–15) |
-| `compact` | boolean | `false` | Merge cells into coarser parents where possible |
-| `return_geometry` | boolean | `false` | Include GeoJSON hex boundaries |
-
-**💡 Prompt:** *"Give me H3 cells at resolution 7 for downtown Chicago, include the hex geometries"*
-
----
-
-### `search_overpass`
-
-Execute an Overpass query within a bounding box or radius. Returns structured results with names, coordinates, and tags. The verification link plots each result as a pin on the map.
-
-| Param | Type | Default | Description |
-|---|---|---|---|
-| `bbox` | string | — | Input geometry |
-| `query` | string | — | Overpass QL (e.g. `nwr["amenity"="cafe"]`). The server wraps it in the appropriate spatial filter automatically. |
-| `radius_meters` | number | — | Search radius in metres. Use only when the user specifies an explicit distance (e.g. `2000` for "within 2km"). Omit for area/region queries. |
-| `limit` | number | `100` | Max elements returned |
-
-**💡 Prompt:** *"Find all parking within 2km of JFK airport"*
-
-**💡 Prompt:** *"Search for hospitals in Manhattan, limit 50"*
-
----
-
-### `list_osm_tags`
-
-Look up the correct OpenStreetMap tags for a category before writing an Overpass query.
-
-| Param | Type | Description |
-|---|---|---|
-| `category` | string | Broad category (e.g. `"food"`, `"health"`, `"transport"`) |
-
-**💡 Prompt:** *"What are the correct OSM tags for supermarkets?"*
-
----
-
-### `aggregate_overpass_h3`
-
-Run an Overpass query and bin results into H3 hexagons for spatial density analysis. Returns counts per cell and GeoJSON hex boundaries.
-
-| Param | Type | Default | Description |
-|---|---|---|---|
-| `bbox` | string | — | Input geometry |
-| `query` | string | — | Overpass QL core query |
-| `resolution` | number | `8` | H3 resolution for binning |
-
-**💡 Prompt:** *"Aggregate all hospitals in Seattle into H3 bins at resolution 7"*
-
----
-
-### `generate_share_url`
-
-Generate a shareable link to visualize a bounding box on the interactive map at vibhorsingh.com/boundingbox.
-
-| Param | Type | Description |
-|---|---|---|
-| `bbox` | string | Input geometry |
-
-**💡 Prompt:** *"Generate a share link for bbox 40.7128,-74.0060,40.7580,-73.9855"*
-
----
-
-## Supported Input Formats
-
-All tools auto-detect the input format. No need to specify which one you're using.
-
-| Format | Example |
+| Variable | Purpose / default |
 |---|---|
-| Raw coordinates | `40.7128,-74.0060,40.7580,-73.9855` |
-| WKT | `POLYGON((-74.006 40.712, -73.985 40.712, ...))` |
-| GeoJSON | `{"type":"Feature","geometry":{...}}` |
-| GeoJSON bbox | `{"bbox":[-74.006,40.712,-73.985,40.758]}` |
-| ogrinfo extent | `Extent: (-74.006, 40.712) - (-73.985, 40.758)` |
-| Space-separated | `40.7128 -74.0060 40.7580 -73.9855` |
+| `OSM_USER_AGENT` | Identify your application and contact; defaults to the server name, version, and repository URL. |
+| `NOMINATIM_EMAIL` | Optional contact email for Nominatim requests. |
+| `NOMINATIM_API_URL` | Geocoder endpoint; defaults to `https://nominatim.openstreetmap.org`. |
+| `PHOTON_API_URL` | Fallback geocoder; defaults to `https://photon.komoot.io`. |
+| `MAPBOX_ACCESS_TOKEN` | Optional additional geocoding fallback. |
+| `OVERPASS_API_URL` | Custom Overpass endpoint(s); defaults rotate across public instances. |
+| `OSRM_API_URL` | Preferred routing endpoint; defaults use public OSRM services. |
+| `ELEVATION_API_URL` | Elevation endpoint; defaults to `https://api.open-meteo.com/v1/elevation`. |
+| `MAX_H3_CELLS` | H3 generation cap; defaults to `50000`. |
 
----
+</details>
 
-## 🤖 For AI Agent Developers
+## For developers
 
-### Response structure
+Successful calls return readable `content` and `structuredContent` matching the tool's output schema, including `provenance`, `complete`, and `warnings`. Spatial tools also return `share_url`. Errors use `isError: true`; structured logs go to stderr, keeping stdout reserved for MCP.
 
-Every tool returns two content blocks:
+To run from source:
 
-1. **Human-readable text** — formatted output with the map verification link
-2. **Structured JSON** — all computed data, machine-parseable
-
-Example `get_bounds` JSON response:
-
-```json
-{
-  "original_wgs84": { "lat1": 40.7128, "lng1": -74.006, "lat2": 40.758, "lng2": -73.9855 },
-  "projected": { "xmin": -8238310.23, "ymin": 4970241.32, "xmax": -8235527.11, "ymax": 4976491.56 },
-  "center": { "lat": 40.7354, "lng": -73.99575 },
-  "tile_indices": { "z": 15, "x": 9660, "y": 12284 },
-  "epsg": "3857",
-  "coord_order": "lng,lat",
-  "area_km2": 8.681,
-  "dimensions": { "width_km": 1.714, "height_km": 5.066 },
-  "share_url": "https://vibhorsingh.com/boundingbox/#40.712800,-74.006000,40.758000,-73.985500"
-}
+```sh
+npm install
+npm test
+npm start
 ```
 
+`npm test` builds the server and runs the test suite.
 
-### Error handling
+## Data and service use
 
-All errors return `isError: true` with a descriptive message. Invalid coordinates, unknown EPSG codes, and oversized H3 requests all return clean errors — the server never crashes on bad input.
+Data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright). Public services have usage limits: avoid bulk scraping and frequent polling, and configure your own endpoints for shared or heavy workloads.
 
-### Logging
+- [Nominatim](https://operations.osmfoundation.org/policies/nominatim/) and [FOSSGIS routing](https://routing.openstreetmap.de/about.html) limit requests to 1 per second. Nominatim also requires application identification, caching, and attribution. The server's per-process queue does not cover traffic across multiple instances.
+- [Photon's public endpoint](https://github.com/komoot/photon#demo-server) is a demo service without availability guarantees.
+- [Open-Meteo's free API](https://open-meteo.com/en/terms) is for non-commercial use. Elevation grids return sample statistics, not guaranteed terrain-wide extrema or slopes.
 
-Structured JSON logs go to **stderr** (stdout is reserved for MCP protocol). Each entry includes timestamp, level, and context.
-
----
-## Acknowledgments & Fair Use
-
-### OpenStreetMap
-
-This tool is built on [OpenStreetMap](https://www.openstreetmap.org/): A global dataset created and maintained by millions of volunteers. Every query you run returns data that someone walked, mapped, or verified by hand. If you find this useful, consider [contributing to OSM](https://wiki.openstreetmap.org/wiki/How_to_contribute).
-
-### Responsible Usage
-
-The public Overpass and Nominatim API instances are free community resources with limited capacity. Avoid tight loops, excessive polling, or bulk-scraping. If hosting this as a shared/remote MCP server, point `NOMINATIM_API_URL` and `OVERPASS_API_URL` at your own instance or a commercial provider (see [Overpass API installation](https://wiki.openstreetmap.org/wiki/Overpass_API/Installation) and [Nominatim installation](https://nominatim.org/release-docs/latest/admin/Installation/)). The default server rotation for Overpass helps spread load, but it's not a substitute for responsible usage.
-
----
-## License
-MIT
-
-[![MCP Badge](https://lobehub.com/badge/mcp-full/iamvibhorsingh-bbox-mcp-server)](https://lobehub.com/mcp/iamvibhorsingh-bbox-mcp-server)
+[MIT License](./LICENSE)
