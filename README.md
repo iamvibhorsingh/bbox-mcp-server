@@ -2,7 +2,7 @@
 
 **FREE Geospatial tools for AI agents, with results you can inspect on a map.**
 
-Search OpenStreetMap, convert coordinates, generate H3 grids, calculate routes, and sample terrain elevation. **10 MCP tools, no API keys required to get started.** Spatial results include shareable links to the [interactive map](https://vibhorsingh.com/boundingbox/).
+Search OpenStreetMap, convert coordinates, generate H3 grids, calculate routes, and sample terrain elevation. **11 MCP tools, no API keys required to get started.** Spatial results include shareable links to the [interactive map](https://vibhorsingh.com/boundingbox/).
 
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-green)](https://nodejs.org/) [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
@@ -14,6 +14,7 @@ Search OpenStreetMap, convert coordinates, generate H3 grids, calculate routes, 
 - “Where are Manhattan’s coffee hotspots?”
 - “EV road trip: find chargers within 5km of Monterey.”
 - “How high up is Denver, really?”
+- “Find the route with the fewest traffic lights from Times Square to Central Park.”
 
 ## Quick start
 
@@ -48,9 +49,10 @@ Requires **Node.js 18+**. Add this to your MCP client configuration:
 | `search_overpass` | Find or count OSM features within an area, bounding box, or radius. |
 | `list_osm_tags` | Find OSM tags by category using curated suggestions and Taginfo fallback. |
 | `aggregate_overpass_h3` | Group OSM query results into H3 hexagons for density analysis. |
-| `calculate_route` | Get driving, walking, or cycling distance, duration, and route geometry. |
+| `calculate_route` | Get driving, walking, or cycling routes with optional waypoints, alternatives, and geometry. |
 | `get_elevation` | Get elevation for points or sample a terrain grid using the 90m Copernicus DEM. |
 | `spatial_calc` | Calculate geometry relations, point containment, distance/bearing, and grid subdivisions offline. |
+| `check_traffic_controls` | Check traffic signals and stop signs at a junction, in a bbox/radius, or along a route. |
 
 Your MCP client discovers each tool's full parameter and output schemas automatically. H3 tools use `resolution` (0–15).
 

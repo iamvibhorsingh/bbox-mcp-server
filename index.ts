@@ -1253,6 +1253,135 @@ function calculateBearingDegrees(lat1: number, lng1: number, lat2: number, lng2:
     return { degrees: Math.round(degrees * 100) / 100, cardinal };
 }
 
+/**
+ * Parses and validates a GeoJSON LineString or raw [[lng, lat], ...] coordinate array
+ * for route-corridor traffic control queries.
+ */
+function parseRouteCoordinates(input: unknown): number[][] {
+    let parsed = input;
+    if (typeof parsed === 'string') {
+        try {
+            parsed = JSON.parse(parsed);
+        } catch (err: any) {
+            throw new Error(`Invalid route_geometry JSON: ${err?.message}`);
+        }
+    }
+
+    const rawCoords = Array.isArray(parsed)
+        ? parsed
+        : (parsed && typeof parsed === 'object' && (parsed as any).type === 'LineString' && Array.isArray((parsed as any).coordinates))
+            ? (parsed as any).coordinates
+            : null;
+
+    if (!rawCoords || rawCoords.length < 2) {
+        throw new Error(`route_geometry must be a GeoJSON LineString or [[lng, lat], ...] array with at least 2 points.`);
+    }
+
+    const validCoords: number[][] = [];
+    for (const pt of rawCoords) {
+        if (!Array.isArray(pt) || pt.length < 2 || typeof pt[0] !== 'number' || typeof pt[1] !== 'number') {
+            throw new Error(`Invalid coordinate pair in route_geometry; expected [lng, lat] numbers.`);
+        }
+        const [lng, lat] = pt;
+        if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+            throw new Error(`Out-of-bounds coordinate [${lng}, ${lat}] in route_geometry.`);
+        }
+        validCoords.push([lng, lat]);
+    }
+    return validCoords;
+}
+
+/**
+ * Thins a route polyline to keep Overpass (around:radius,...) queries fast and bounded
+ * while preserving the start, end, and turns.
+ */
+function downsampleRouteCoords(coordsLngLat: number[][], maxPoints = 250): number[][] {
+    if (coordsLngLat.length <= maxPoints) return coordsLngLat;
+
+    // First pass: drop redundant vertices closer than 15m to the previous kept vertex
+    const thinned: number[][] = [coordsLngLat[0]];
+    for (let i = 1; i < coordsLngLat.length - 1; i++) {
+        const prev = thinned[thinned.length - 1];
+        const curr = coordsLngLat[i];
+        if (calculateHaversineDistanceMeters(prev[1], prev[0], curr[1], curr[0]) >= 15) {
+            thinned.push(curr);
+        }
+    }
+    thinned.push(coordsLngLat[coordsLngLat.length - 1]);
+    if (thinned.length <= maxPoints) return thinned;
+
+    const sampled: number[][] = [];
+    for (let i = 0; i < maxPoints; i++) {
+        const idx = Math.min(
+            thinned.length - 1,
+            Math.round((i / (maxPoints - 1)) * (thinned.length - 1))
+        );
+        sampled.push(thinned[idx]);
+    }
+    return sampled;
+}
+
+/**
+ * Projects a point onto a route polyline ([lng, lat][]) to determine lateral offset
+ * from the route centerline and approximate distance traveled from route start.
+ */
+function projectPointOntoRoute(
+    lat: number,
+    lon: number,
+    coordsLngLat: number[][]
+): { distanceToRouteMeters: number; distanceAlongRouteMeters: number } {
+    let bestDist = Infinity;
+    let bestAlong = 0;
+    let cumulative = 0;
+
+    for (let i = 0; i < coordsLngLat.length - 1; i++) {
+        const [lng1, lat1] = coordsLngLat[i];
+        const [lng2, lat2] = coordsLngLat[i + 1];
+        const segLen = calculateHaversineDistanceMeters(lat1, lng1, lat2, lng2);
+
+        const cosLat = Math.cos(((lat1 + lat2) / 2) * Math.PI / 180);
+        const ax = lng1 * cosLat, ay = lat1;
+        const bx = lng2 * cosLat, by = lat2;
+        const px = lon * cosLat, py = lat;
+        const dx = bx - ax, dy = by - ay;
+        const lenSq = dx * dx + dy * dy;
+        const t = lenSq > 0 ? Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lenSq)) : 0;
+
+        const projLat = lat1 + t * (lat2 - lat1);
+        const projLng = lng1 + t * (lng2 - lng1);
+        const dist = calculateHaversineDistanceMeters(lat, lon, projLat, projLng);
+
+        if (dist < bestDist) {
+            bestDist = dist;
+            bestAlong = cumulative + t * segLen;
+        }
+        cumulative += segLen;
+    }
+
+    return {
+        distanceToRouteMeters: Math.round(bestDist * 10) / 10,
+        distanceAlongRouteMeters: Math.round(bestAlong * 10) / 10
+    };
+}
+
+function classifyTrafficControlElement(
+    element: any,
+    includeCrossings: boolean
+): 'traffic_signal' | 'stop_sign' | null {
+    const tags = element?.tags;
+    if (!tags) return null;
+    if (tags.highway === 'traffic_signals') return 'traffic_signal';
+    if (tags.highway === 'stop') return 'stop_sign';
+    if (
+        includeCrossings &&
+        tags.highway === 'crossing' &&
+        (tags.crossing === 'traffic_signals' || tags['crossing:signals'] === 'yes')
+    ) {
+        return 'traffic_signal';
+    }
+    return null;
+}
+
 function isPointInPolygonRing(lat: number, lng: number, ringLatLng: number[][]): boolean {
     let inside = false;
     for (let i = 0, j = ringLatLng.length - 1; i < ringLatLng.length; j = i++) {
@@ -1602,6 +1731,250 @@ function buildShareUrlCircleWithMarkers(
             return `${e.coordinates.lat.toFixed(6)},${e.coordinates.lon.toFixed(6)},${encodeURIComponent(name)}`;
         });
     return `https://vibhorsingh.com/boundingbox/#${[circlePart, ...markerParts].join('|')}`;
+}
+
+async function resolveRouteEndpoint(
+    input: string,
+    warnings: string[]
+): Promise<{ lat: number; lng: number; label: string }> {
+    const coordMatch = input.match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/);
+    if (coordMatch) {
+        const p0 = parseFloat(coordMatch[1]);
+        const p1 = parseFloat(coordMatch[2]);
+        if (validateBBox(p0, p1, p0, p1)) {
+            return { lat: p0, lng: p1, label: `(${p0.toFixed(5)}, ${p1.toFixed(5)})` };
+        } else if (validateBBox(p1, p0, p1, p0)) {
+            warnings.push(`Endpoint '${input}' interpreted as lng,lat -> converted to lat=${p1}, lng=${p0}.`);
+            return { lat: p1, lng: p0, label: `(${p1.toFixed(5)}, ${p0.toFixed(5)})` };
+        }
+    }
+    const geo = await geocodeLocation(input);
+    return { lat: geo.center.lat, lng: geo.center.lng, label: geo.matched_place };
+}
+
+interface RouteEndpoint {
+    lat: number;
+    lng: number;
+    label: string;
+}
+
+function summarizeOsrmRoute(
+    routeObj: any,
+    start: RouteEndpoint,
+    end: RouteEndpoint,
+    waypoints: RouteEndpoint[],
+    straightLineMeters: number,
+    returnSteps: boolean
+) {
+    const distanceMeters = Math.round(routeObj.distance * 10) / 10;
+    const durationSeconds = Math.round(routeObj.duration);
+    const durationMinutes = Math.round((durationSeconds / 60) * 10) / 10;
+    const detourFactor = straightLineMeters > 0 ? Math.round((distanceMeters / straightLineMeters) * 100) / 100 : 1;
+
+    const geomCoords: number[][] = (routeObj.geometry?.coordinates && routeObj.geometry.coordinates.length >= 2)
+        ? routeObj.geometry.coordinates
+        : [[start.lng, start.lat], ...waypoints.map(w => [w.lng, w.lat]), [end.lng, end.lat]];
+    const routeGeometry = {
+        type: "LineString" as const,
+        coordinates: geomCoords
+    };
+    const lats = geomCoords.map(c => c[1]);
+    const lngs = geomCoords.map(c => c[0]);
+    const routeBBox = ensureValidBBox(safeMin(lats), safeMin(lngs), safeMax(lats), safeMax(lngs));
+
+    const midIdx = Math.floor(geomCoords.length / 2);
+    const midPt = geomCoords[midIdx] || [(start.lng + end.lng) / 2, (start.lat + end.lat) / 2];
+
+    const markers = [
+        { coordinates: { lat: start.lat, lon: start.lng }, name: `Origin: ${start.label}` },
+        ...waypoints.map((w, idx) => ({
+            coordinates: { lat: w.lat, lon: w.lng },
+            name: `WP ${idx + 1}: ${w.label}`
+        })),
+        ...(waypoints.length === 0
+            ? [{ coordinates: { lat: midPt[1], lon: midPt[0] }, name: `Route (${(distanceMeters / 1000).toFixed(1)}km, ${durationMinutes}min)` }]
+            : []),
+        { coordinates: { lat: end.lat, lon: end.lng }, name: `Dest: ${end.label}` }
+    ];
+    const shareUrl = buildShareUrlWithRoute(routeBBox, geomCoords, markers);
+
+    const steps = returnSteps && Array.isArray(routeObj.legs)
+        ? routeObj.legs.flatMap((leg: any) => leg.steps || []).map((s: any) => ({
+            name: s.name || "unnamed road",
+            distance_meters: Math.round(s.distance),
+            duration_seconds: Math.round(s.duration),
+            ...(s.maneuver?.type ? { maneuver: `${s.maneuver.type}${s.maneuver.modifier ? ' ' + s.maneuver.modifier : ''}` } : {}),
+            ...(Array.isArray(s.maneuver?.location) && s.maneuver.location.length >= 2
+                ? { location: { lat: s.maneuver.location[1], lng: s.maneuver.location[0] } }
+                : {})
+        }))
+        : undefined;
+
+    return {
+        routeObj,
+        geomCoords,
+        routeGeometry,
+        routeBBox,
+        distanceMeters,
+        distanceKm: Math.round((distanceMeters / 1000) * 100) / 100,
+        durationSeconds,
+        durationMinutes,
+        detourFactor,
+        steps,
+        shareUrl
+    };
+}
+
+async function fetchOsrmRoute(
+    originInput: string,
+    destInput: string,
+    profile: "driving" | "walking" | "cycling",
+    returnSteps: boolean,
+    warnings: string[],
+    options?: { waypoints?: string[]; alternatives?: boolean }
+) {
+    const rawWaypoints = options?.waypoints || [];
+    if (rawWaypoints.length > 20) {
+        throw new Error(`Too many waypoints (${rawWaypoints.length}); maximum allowed is 20.`);
+    }
+
+    const start = await resolveRouteEndpoint(originInput, warnings);
+    const resolvedWaypoints: RouteEndpoint[] = [];
+    for (const wp of rawWaypoints) {
+        const trimmed = typeof wp === 'string' ? wp.trim() : '';
+        if (!trimmed) {
+            throw new Error(`Each waypoint must be a non-empty 'lat,lng' or place name string.`);
+        }
+        resolvedWaypoints.push(await resolveRouteEndpoint(trimmed, warnings));
+    }
+    const end = await resolveRouteEndpoint(destInput, warnings);
+
+    const requestAlternatives = options?.alternatives === true && resolvedWaypoints.length === 0;
+    if (options?.alternatives === true && resolvedWaypoints.length > 0) {
+        warnings.push("OSRM does not support alternative routes when waypoints are provided; returning the waypoint route only.");
+    }
+
+    const straightLineMeters = calculateHaversineDistanceMeters(start.lat, start.lng, end.lat, end.lng);
+    const bearing = calculateBearingDegrees(start.lat, start.lng, end.lat, end.lng);
+
+    // OSRM public servers (FOSSGIS Germany regional profiles + OSRM main demo)
+    const osrmProfileMap: Record<string, { fossgis: string; main: string }> = {
+        driving: { fossgis: "routed-car/route/v1/driving", main: "route/v1/driving" },
+        walking: { fossgis: "routed-foot/route/v1/driving", main: "route/v1/foot" },
+        cycling: { fossgis: "routed-bike/route/v1/driving", main: "route/v1/bike" }
+    };
+    const prof = osrmProfileMap[profile] || osrmProfileMap.driving;
+    const allStops = [start, ...resolvedWaypoints, end];
+    const coordsPair = allStops.map(p => `${p.lng.toFixed(6)},${p.lat.toFixed(6)}`).join(';');
+    const queryParams = `?overview=full&geometries=geojson&steps=${returnSteps ? 'true' : 'false'}${requestAlternatives ? '&alternatives=3' : ''}`;
+    const routeCacheKey = `${profile}:${coordsPair}:${returnSteps}:${requestAlternatives}`;
+
+    let rawRoutes: any[] | null = null;
+    let usedProvider = "";
+    let cachedRoute = false;
+    let cacheAgeMs = 0;
+    let dataTimestamp = new Date().toISOString();
+
+    const cachedEntry = ROUTE_CACHE.get(routeCacheKey);
+    if (cachedEntry && (Date.now() - cachedEntry.timestamp < ROUTE_CACHE_TTL_MS)) {
+        rawRoutes = Array.isArray(cachedEntry.data) ? cachedEntry.data : [cachedEntry.data];
+        usedProvider = cachedEntry.provider;
+        cachedRoute = true;
+        cacheAgeMs = Date.now() - cachedEntry.timestamp;
+        dataTimestamp = new Date(cachedEntry.timestamp).toISOString();
+    } else {
+        const routingUrls: Array<{ url: string; provider: string }> = [
+            {
+                url: `https://routing.openstreetmap.de/${prof.fossgis}/${coordsPair}${queryParams}`,
+                provider: "fossgis-osrm (https://routing.openstreetmap.de)"
+            },
+            {
+                url: `https://router.project-osrm.org/${prof.main}/${coordsPair}${queryParams}`,
+                provider: "project-osrm-demo (https://router.project-osrm.org)"
+            }
+        ];
+        if (process.env.OSRM_API_URL) {
+            const customBase = process.env.OSRM_API_URL.replace(/\/+$/, "");
+            routingUrls.unshift({
+                url: `${customBase}/${prof.main}/${coordsPair}${queryParams}`,
+                provider: `custom-osrm (${customBase})`
+            });
+        }
+
+        let lastRouteErr: Error | null = null;
+
+        for (const candidate of routingUrls) {
+            await routingRateLimit();
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+            try {
+                const res = await fetch(candidate.url, {
+                    headers: {
+                        'User-Agent': APP_USER_AGENT,
+                        'Accept': 'application/json'
+                    },
+                    signal: controller.signal
+                });
+                if (!res.ok) throw new Error(`Status ${res.status}`);
+                const json = await res.json();
+                if (json.code === "Ok" && Array.isArray(json.routes) && json.routes.length > 0) {
+                    rawRoutes = json.routes;
+                    usedProvider = candidate.provider;
+                    const now = Date.now();
+                    dataTimestamp = new Date(now).toISOString();
+                    ROUTE_CACHE.set(routeCacheKey, { timestamp: now, data: rawRoutes, provider: usedProvider });
+                    break;
+                }
+                throw new Error(json.message || `Routing returned code ${json.code}`);
+            } catch (err: any) {
+                lastRouteErr = err;
+                log('warn', `OSRM routing failed at ${candidate.url}`, { error: err.message });
+            } finally {
+                clearTimeout(timeout);
+            }
+        }
+
+        if (!rawRoutes || rawRoutes.length === 0) {
+            throw new Error(`Route calculation failed on all configured OSRM servers: ${lastRouteErr?.message}`);
+        }
+    }
+
+    const summarized = rawRoutes.map(r =>
+        summarizeOsrmRoute(r, start, end, resolvedWaypoints, straightLineMeters, returnSteps)
+    );
+    const primary = summarized[0];
+    const alternatives = summarized.slice(1);
+
+    const provenance: ProvenanceMetadata = {
+        provider: usedProvider,
+        attribution: OSM_ATTRIBUTION,
+        data_timestamp: dataTimestamp,
+        cached: cachedRoute,
+        cache_age_ms: cacheAgeMs,
+        usage_policy: "https://routing.openstreetmap.de/about.html (Max 1 req/s, no heavy/bulk usage; configure OSRM_API_URL for production workloads)"
+    };
+
+    return {
+        profile,
+        start,
+        end,
+        waypoints: resolvedWaypoints,
+        routeData: primary.routeObj,
+        geomCoords: primary.geomCoords,
+        routeGeometry: primary.routeGeometry,
+        routeBBox: primary.routeBBox,
+        distanceMeters: primary.distanceMeters,
+        distanceKm: primary.distanceKm,
+        durationSeconds: primary.durationSeconds,
+        durationMinutes: primary.durationMinutes,
+        straightLineMeters,
+        detourFactor: primary.detourFactor,
+        steps: primary.steps,
+        shareUrl: primary.shareUrl,
+        alternatives,
+        bearing,
+        provenance
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -2088,7 +2461,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             {
                 name: "calculate_route",
-                description: "Calculate real-world travel distance, duration, turn-by-turn summary, GeoJSON route geometry, and route bounding box between two locations or coordinate pairs using OpenStreetMap routing (FOSSGIS / OSRM, or configurable OSRM_API_URL). Draws the actual route path on the verification map and enforces rate limits (max 1 req/s).",
+                description: "Calculate real-world travel distance, duration, turn-by-turn summary (with maneuver coordinates), GeoJSON route geometry, and route bounding box between two locations or coordinate pairs using OpenStreetMap routing (FOSSGIS / OSRM, or configurable OSRM_API_URL). Supports optional intermediate 'waypoints' and requesting 'alternatives' (up to 3 OSRM routes for side-by-side comparison with check_traffic_controls).",
                 annotations: {
                     title: "Calculate Route Distance, Duration & Geometry",
                     readOnlyHint: true,
@@ -2107,6 +2480,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                             type: "string",
                             description: "Ending point as 'lat,lng' coordinates (e.g. '40.6413,-73.7781') or a natural-language place name (e.g. 'JFK Airport')."
                         },
+                        waypoints: {
+                            type: "array",
+                            description: "Optional list of intermediate via-points ('lat,lng' or place names, up to 20) to force the route through specific streets or intersections.",
+                            items: { type: "string" }
+                        },
                         profile: {
                             type: "string",
                             description: "Travel mode profile: 'driving' (car), 'walking' (foot), or 'cycling' (bicycle). Defaults to 'driving'.",
@@ -2114,7 +2492,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         },
                         return_steps: {
                             type: "boolean",
-                            description: "If true, includes step-by-step road names and maneuver instructions. Defaults to false."
+                            description: "If true, includes step-by-step road names, maneuver instructions, and turn coordinates. Defaults to false."
+                        },
+                        alternatives: {
+                            type: "boolean",
+                            description: "If true, requests up to 3 alternative routes from OSRM (only supported when 'waypoints' is empty). Defaults to false."
                         }
                     },
                     required: ["origin", "destination"]
@@ -2132,6 +2514,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                             type: "object",
                             properties: { lat: { type: "number" }, lng: { type: "number" }, label: { type: "string" } },
                             required: ["lat", "lng", "label"]
+                        },
+                        waypoints: {
+                            type: "array",
+                            items: {
+                                type: "object",
+                                properties: { lat: { type: "number" }, lng: { type: "number" }, label: { type: "string" } },
+                                required: ["lat", "lng", "label"]
+                            }
                         },
                         distance_meters: { type: "number" },
                         distance_km: { type: "number" },
@@ -2154,6 +2544,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                             required: ["type", "coordinates"]
                         },
                         steps: { type: "array", items: { type: "object" } },
+                        alternatives_count: { type: "number" },
+                        alternatives: { type: "array", items: { type: "object" } },
                         share_url: { type: "string" },
                         provenance: PROVENANCE_SCHEMA,
                         complete: { type: "boolean" },
@@ -2313,6 +2705,145 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         warnings: { type: "array", items: { type: "string" } }
                     },
                     required: ["operation", "share_url", "provenance", "complete", "warnings"]
+                }
+            },
+            {
+                name: "check_traffic_controls",
+                description: "Check OpenStreetMap for traffic signals (traffic lights) and stop signs at a junction, within a radius of a coordinate/place, across a bounding box/area, or along a route corridor. Returns explicit booleans (has_traffic_signal, has_stop_sign), junction classification (control_type: 'traffic_signals' | 'stop_sign' | 'both' | 'none'), separate counts, exact coordinates, and a shareable verification map.\n\nMODES:\n- Junction / Coordinate: pass a point in 'bbox' (e.g. '40.7580,-73.9855') with optional 'radius_meters' (defaults to 35m).\n- Bounding box / Area: pass a bbox or 'location' (without 'radius_meters') to count or list all traffic signals and stop signs inside.\n- Route corridor (by endpoints): pass 'origin' and 'destination' (plus optional 'profile': driving/walking/cycling) to route via OSRM and inspect traffic controls along the route in one call.\n- Route corridor (by geometry): pass 'route_geometry' (the GeoJSON LineString from calculate_route) with optional 'radius_meters' (defaults to 20m) to evaluate traffic signals and stop signs along a route in travel order.",
+                annotations: {
+                    title: "Check Traffic Signals & Stop Signs",
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: true
+                },
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        location: {
+                            type: "string",
+                            description: "A text location or intersection to check (e.g. 'Manhattan', '5th Ave and 42nd St, New York'). Provide 'location', 'bbox', 'route_geometry', or 'origin'+'destination'."
+                        },
+                        bbox: {
+                            type: "string",
+                            description: "Point 'lat,lng', bounding box 'lat1,lng1,lat2,lng2', WKT, GeoJSON, tile 'z/x/y', or ogrinfo extent. For a single point, 'radius_meters' defaults to 35m if omitted."
+                        },
+                        origin: {
+                            type: "string",
+                            description: "Route origin ('lat,lng' or place name) when evaluating traffic controls directly between two points. Must be paired with 'destination'."
+                        },
+                        destination: {
+                            type: "string",
+                            description: "Route destination ('lat,lng' or place name) when evaluating traffic controls directly between two points. Must be paired with 'origin'."
+                        },
+                        profile: {
+                            type: "string",
+                            description: "Routing profile when using 'origin' and 'destination': 'driving' (default), 'walking', or 'cycling'.",
+                            enum: ["driving", "walking", "cycling"]
+                        },
+                        route_geometry: {
+                            type: "object",
+                            description: "GeoJSON LineString ({ type: 'LineString', coordinates: [[lng, lat], ...] }) from calculate_route to find traffic signals and stop signs along a route corridor.",
+                            properties: {
+                                type: { type: "string" },
+                                coordinates: {
+                                    type: "array",
+                                    items: {
+                                        type: "array",
+                                        items: { type: "number" }
+                                    }
+                                }
+                            },
+                            required: ["type", "coordinates"]
+                        },
+                        radius_meters: {
+                            type: "number",
+                            description: "Search radius in meters. Enables circle mode around a point/location (defaults to 35m for a single point) or corridor width around a route (defaults to 20m)."
+                        },
+                        include_crossings: {
+                            type: "boolean",
+                            description: "If true, also treats signalized pedestrian crossings (highway=crossing with crossing=traffic_signals or crossing:signals=yes) as traffic signals. Defaults to false."
+                        },
+                        count_only: {
+                            type: "boolean",
+                            description: "If true, returns presence booleans and counts without individual feature coordinates. Defaults to false."
+                        },
+                        limit: {
+                            type: "number",
+                            description: "Maximum total elements to return across traffic_signals and stop_signs when count_only is false. Default is 200 (max 1000)."
+                        },
+                        offset: {
+                            type: "number",
+                            description: "Pagination offset when count_only is false. Default is 0."
+                        },
+                        timeout_seconds: {
+                            type: "number",
+                            description: "Overpass server query timeout in seconds. Default is 25."
+                        },
+                        use_area_boundary: {
+                            type: "boolean",
+                            description: "If true (default), uses exact OSM administrative boundary polygon for named locations when available."
+                        }
+                    }
+                },
+                outputSchema: {
+                    type: "object",
+                    properties: {
+                        search_mode: { type: "string" },
+                        count_only: { type: "boolean" },
+                        matched_place: { type: "string" },
+                        alternatives: { type: "array", items: { type: "object" } },
+                        osm_area_id: { type: "number" },
+                        has_traffic_signal: { type: "boolean" },
+                        has_stop_sign: { type: "boolean" },
+                        control_type: {
+                            type: "string",
+                            enum: ["traffic_signals", "stop_sign", "both", "none"]
+                        },
+                        counts: {
+                            type: "object",
+                            properties: {
+                                traffic_signals: { type: "number" },
+                                stop_signs: { type: "number" },
+                                total: { type: "number" }
+                            },
+                            required: ["traffic_signals", "stop_signs", "total"]
+                        },
+                        distance_from: { type: "object" },
+                        route_summary: { type: "object" },
+                        traffic_signals: { type: "array", items: { type: "object" } },
+                        stop_signs: { type: "array", items: { type: "object" } },
+                        returned_counts: {
+                            type: "object",
+                            properties: {
+                                traffic_signals: { type: "number" },
+                                stop_signs: { type: "number" },
+                                total: { type: "number" }
+                            },
+                            required: ["traffic_signals", "stop_signs", "total"]
+                        },
+                        offset: { type: "number" },
+                        limit: { type: "number" },
+                        truncated: { type: "boolean" },
+                        has_more: { type: "boolean" },
+                        next_offset: { type: "number" },
+                        share_url: { type: "string" },
+                        provenance: PROVENANCE_SCHEMA,
+                        complete: { type: "boolean" },
+                        warnings: { type: "array", items: { type: "string" } }
+                    },
+                    required: [
+                        "search_mode",
+                        "count_only",
+                        "has_traffic_signal",
+                        "has_stop_sign",
+                        "control_type",
+                        "counts",
+                        "share_url",
+                        "provenance",
+                        "complete",
+                        "warnings"
+                    ]
                 }
             }
         ],
@@ -2903,6 +3434,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 case category.includes('childcare') || category.includes('daycare') || category.includes('child'):
                     recommendations = `Childcare/Daycare: nwr["amenity"="childcare"]\nPlaygrounds: nwr["leisure"="playground"]`;
                     break;
+                case category.includes('traffic') || category.includes('signal') || category.includes('stop') || category.includes('junction') || category.includes('intersection'):
+                    recommendations = `Traffic Signals: nwr["highway"="traffic_signals"]\nStop Signs: nwr["highway"="stop"]\nYield / Give Way Signs: nwr["highway"="give_way"]\nSignalized Crossings: nwr["highway"="crossing"]["crossing"="traffic_signals"]\nTraffic Signals & Stop Signs: nwr["highway"~"^(traffic_signals|stop)$"]`;
+                    break;
                 default: {
                     log('info', `Category '${category}' not in index, querying Taginfo API`);
                     source = "taginfo";
@@ -3110,169 +3644,69 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const destInput = (args.destination as string || "").trim();
             const profile = (args.profile as "driving" | "walking" | "cycling") || "driving";
             const returnSteps = args.return_steps as boolean || false;
+            const requestAlternatives = args.alternatives === true;
+            const rawWaypoints = Array.isArray(args.waypoints) ? args.waypoints as string[] : undefined;
             const warnings: string[] = [];
 
             if (!originInput || !destInput) {
                 return { content: [{ type: "text", text: "Error: Both 'origin' and 'destination' are required." }], isError: true };
             }
-
-            async function resolveEndpoint(input: string): Promise<{ lat: number; lng: number; label: string }> {
-                const coordMatch = input.match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/);
-                if (coordMatch) {
-                    const p0 = parseFloat(coordMatch[1]);
-                    const p1 = parseFloat(coordMatch[2]);
-                    if (validateBBox(p0, p1, p0, p1)) {
-                        return { lat: p0, lng: p1, label: `(${p0.toFixed(5)}, ${p1.toFixed(5)})` };
-                    } else if (validateBBox(p1, p0, p1, p0)) {
-                        warnings.push(`Endpoint '${input}' interpreted as lng,lat -> converted to lat=${p1}, lng=${p0}.`);
-                        return { lat: p1, lng: p0, label: `(${p1.toFixed(5)}, ${p0.toFixed(5)})` };
-                    }
-                }
-                const geo = await geocodeLocation(input);
-                return { lat: geo.center.lat, lng: geo.center.lng, label: geo.matched_place };
+            if (args.waypoints !== undefined && !Array.isArray(args.waypoints)) {
+                return { content: [{ type: "text", text: "Error: 'waypoints' must be an array of 'lat,lng' or place name strings." }], isError: true };
             }
 
-            const start = await resolveEndpoint(originInput);
-            const end = await resolveEndpoint(destInput);
-
-            const straightLineMeters = calculateHaversineDistanceMeters(start.lat, start.lng, end.lat, end.lng);
-            const bearing = calculateBearingDegrees(start.lat, start.lng, end.lat, end.lng);
-
-            // OSRM public servers (FOSSGIS Germany regional profiles + OSRM main demo)
-            const osrmProfileMap: Record<string, { fossgis: string; main: string }> = {
-                driving: { fossgis: "routed-car/route/v1/driving", main: "route/v1/driving" },
-                walking: { fossgis: "routed-foot/route/v1/driving", main: "route/v1/foot" },
-                cycling: { fossgis: "routed-bike/route/v1/driving", main: "route/v1/bike" }
-            };
-            const prof = osrmProfileMap[profile] || osrmProfileMap.driving;
-            const coordsPair = `${start.lng.toFixed(6)},${start.lat.toFixed(6)};${end.lng.toFixed(6)},${end.lat.toFixed(6)}`;
-            const queryParams = `?overview=full&geometries=geojson&steps=${returnSteps ? 'true' : 'false'}`;
-            const routeCacheKey = `${profile}:${coordsPair}:${returnSteps}`;
-
-            let routeData: any = null;
-            let usedProvider = "";
-            let cachedRoute = false;
-            let cacheAgeMs = 0;
-            let dataTimestamp = new Date().toISOString();
-
-            const cachedEntry = ROUTE_CACHE.get(routeCacheKey);
-            if (cachedEntry && (Date.now() - cachedEntry.timestamp < ROUTE_CACHE_TTL_MS)) {
-                routeData = cachedEntry.data;
-                usedProvider = cachedEntry.provider;
-                cachedRoute = true;
-                cacheAgeMs = Date.now() - cachedEntry.timestamp;
-                dataTimestamp = new Date(cachedEntry.timestamp).toISOString();
-            } else {
-                const routingUrls: Array<{ url: string; provider: string }> = [
-                    {
-                        url: `https://routing.openstreetmap.de/${prof.fossgis}/${coordsPair}${queryParams}`,
-                        provider: "fossgis-osrm (https://routing.openstreetmap.de)"
-                    },
-                    {
-                        url: `https://router.project-osrm.org/${prof.main}/${coordsPair}${queryParams}`,
-                        provider: "project-osrm-demo (https://router.project-osrm.org)"
-                    }
-                ];
-                if (process.env.OSRM_API_URL) {
-                    const customBase = process.env.OSRM_API_URL.replace(/\/+$/, "");
-                    routingUrls.unshift({
-                        url: `${customBase}/${prof.main}/${coordsPair}${queryParams}`,
-                        provider: `custom-osrm (${customBase})`
-                    });
-                }
-
-                let lastRouteErr: Error | null = null;
-
-                for (const candidate of routingUrls) {
-                    await routingRateLimit();
-                    const controller = new AbortController();
-                    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-                    try {
-                        const res = await fetch(candidate.url, {
-                            headers: {
-                                'User-Agent': APP_USER_AGENT,
-                                'Accept': 'application/json'
-                            },
-                            signal: controller.signal
-                        });
-                        if (!res.ok) throw new Error(`Status ${res.status}`);
-                        const json = await res.json();
-                        if (json.code === "Ok" && Array.isArray(json.routes) && json.routes.length > 0) {
-                            routeData = json.routes[0];
-                            usedProvider = candidate.provider;
-                            const now = Date.now();
-                            dataTimestamp = new Date(now).toISOString();
-                            ROUTE_CACHE.set(routeCacheKey, { timestamp: now, data: routeData, provider: usedProvider });
-                            break;
-                        }
-                        throw new Error(json.message || `Routing returned code ${json.code}`);
-                    } catch (err: any) {
-                        lastRouteErr = err;
-                        log('warn', `OSRM routing failed at ${candidate.url}`, { error: err.message });
-                    } finally {
-                        clearTimeout(timeout);
-                    }
-                }
-
-                if (!routeData) {
-                    return {
-                        content: [{ type: "text", text: `Error: Route calculation failed on all configured OSRM servers: ${lastRouteErr?.message}` }],
-                        isError: true
-                    };
-                }
+            let routeRes;
+            try {
+                routeRes = await fetchOsrmRoute(originInput, destInput, profile, returnSteps, warnings, {
+                    waypoints: rawWaypoints,
+                    alternatives: requestAlternatives
+                });
+            } catch (err: any) {
+                return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
             }
 
-            const distanceMeters = Math.round(routeData.distance * 10) / 10;
-            const durationSeconds = Math.round(routeData.duration);
-            const durationMinutes = Math.round((durationSeconds / 60) * 10) / 10;
-            const detourFactor = straightLineMeters > 0 ? Math.round((distanceMeters / straightLineMeters) * 100) / 100 : 1;
+            const {
+                start,
+                end,
+                waypoints: resolvedWaypoints,
+                geomCoords,
+                routeGeometry,
+                routeBBox,
+                distanceMeters,
+                distanceKm,
+                durationSeconds,
+                durationMinutes,
+                straightLineMeters,
+                detourFactor,
+                steps,
+                shareUrl,
+                alternatives: altRoutes,
+                bearing,
+                provenance
+            } = routeRes;
 
-            // Extract actual route LineString geometry and compute route bounding box
-            const geomCoords: number[][] = (routeData.geometry?.coordinates && routeData.geometry.coordinates.length >= 2)
-                ? routeData.geometry.coordinates
-                : [[start.lng, start.lat], [end.lng, end.lat]];
-            const routeGeometry = {
-                type: "LineString" as const,
-                coordinates: geomCoords
-            };
-            const lats = geomCoords.map(c => c[1]);
-            const lngs = geomCoords.map(c => c[0]);
-            const routeBBox = ensureValidBBox(safeMin(lats), safeMin(lngs), safeMax(lats), safeMax(lngs));
-
-            const midIdx = Math.floor(geomCoords.length / 2);
-            const midPt = geomCoords[midIdx] || [(start.lng + end.lng) / 2, (start.lat + end.lat) / 2];
-
-            const markers = [
-                { coordinates: { lat: start.lat, lon: start.lng }, name: `Origin: ${start.label}` },
-                { coordinates: { lat: midPt[1], lon: midPt[0] }, name: `Route (${(distanceMeters / 1000).toFixed(1)}km, ${durationMinutes}min)` },
-                { coordinates: { lat: end.lat, lon: end.lng }, name: `Dest: ${end.label}` }
-            ];
-            const shareUrl = buildShareUrlWithRoute(routeBBox, geomCoords, markers);
-
-            const steps = returnSteps && routeData.legs?.[0]?.steps
-                ? routeData.legs[0].steps.map((s: any) => ({
-                    name: s.name || "unnamed road",
-                    distance_meters: Math.round(s.distance),
-                    duration_seconds: Math.round(s.duration),
-                    ...(s.maneuver?.type ? { maneuver: `${s.maneuver.type}${s.maneuver.modifier ? ' ' + s.maneuver.modifier : ''}` } : {})
+            const formattedAlternatives = requestAlternatives
+                ? altRoutes.map((alt, idx) => ({
+                    index: idx + 1,
+                    distance_meters: alt.distanceMeters,
+                    distance_km: alt.distanceKm,
+                    duration_seconds: alt.durationSeconds,
+                    duration_minutes: alt.durationMinutes,
+                    detour_factor: alt.detourFactor,
+                    route_bbox: alt.routeBBox,
+                    route_geometry: alt.routeGeometry,
+                    ...(alt.steps ? { steps: alt.steps } : {}),
+                    share_url: alt.shareUrl
                 }))
                 : undefined;
-
-            const provenance: ProvenanceMetadata = {
-                provider: usedProvider,
-                attribution: OSM_ATTRIBUTION,
-                data_timestamp: dataTimestamp,
-                cached: cachedRoute,
-                cache_age_ms: cacheAgeMs,
-                usage_policy: "https://routing.openstreetmap.de/about.html (Max 1 req/s, no heavy/bulk usage; configure OSRM_API_URL for production workloads)"
-            };
 
             const resultPayload = {
                 profile,
                 origin: start,
                 destination: end,
+                ...(resolvedWaypoints.length > 0 ? { waypoints: resolvedWaypoints } : {}),
                 distance_meters: distanceMeters,
-                distance_km: Math.round((distanceMeters / 1000) * 100) / 100,
+                distance_km: distanceKm,
                 duration_seconds: durationSeconds,
                 duration_minutes: durationMinutes,
                 straight_line_meters: Math.round(straightLineMeters * 10) / 10,
@@ -3281,17 +3715,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 route_bbox: routeBBox,
                 route_geometry: routeGeometry,
                 ...(steps ? { steps } : {}),
+                ...(formattedAlternatives !== undefined
+                    ? { alternatives_count: formattedAlternatives.length, alternatives: formattedAlternatives }
+                    : {}),
                 share_url: shareUrl,
                 provenance,
                 complete: true,
                 warnings
             };
 
+            const viaText = resolvedWaypoints.length > 0
+                ? `\nVia: ${resolvedWaypoints.map(w => w.label).join(' → ')}`
+                : '';
+            const altText = formattedAlternatives !== undefined
+                ? (formattedAlternatives.length > 0
+                    ? `\n\nAlternative routes (${formattedAlternatives.length}):\n` + formattedAlternatives
+                        .map(a => `- Alt ${a.index}: ${a.distance_km} km (${a.duration_minutes} min) — ${a.share_url}`)
+                        .join('\n')
+                    : `\n\nAlternative routes: OSRM found no qualifying alternatives for this pair.`)
+                : '';
+
             return {
                 content: [
                     {
                         type: "text",
-                        text: `Route (${profile}): ${start.label} → ${end.label}\nDistance: ${(distanceMeters / 1000).toFixed(2)} km (${distanceMeters.toLocaleString()} m) | Straight-line: ${(straightLineMeters / 1000).toFixed(2)} km (detour factor: ${detourFactor}x)\nEstimated Duration: ${durationMinutes} min (${durationSeconds} s)\nInitial Bearing: ${bearing.degrees}° (${bearing.cardinal})\nGeometry: LineString (${geomCoords.length} vertices)\n\nView route on map: ${shareUrl}${formatWarnings(warnings)}`
+                        text: `Route (${profile}): ${start.label} → ${end.label}${viaText}\nDistance: ${(distanceMeters / 1000).toFixed(2)} km (${distanceMeters.toLocaleString()} m) | Straight-line: ${(straightLineMeters / 1000).toFixed(2)} km (detour factor: ${detourFactor}x)\nEstimated Duration: ${durationMinutes} min (${durationSeconds} s)\nInitial Bearing: ${bearing.degrees}° (${bearing.cardinal})\nGeometry: LineString (${geomCoords.length} vertices)\n\nView route on map: ${shareUrl}${altText}${formatWarnings(warnings)}`
                     }
                 ],
                 structuredContent: resultPayload
@@ -3742,6 +4190,361 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     isError: true
                 };
             }
+        }
+
+        else if (toolName === "check_traffic_controls") {
+            const args = request.params.arguments || {};
+            const includeCrossings = args.include_crossings === true;
+            const countOnly = args.count_only === true;
+            const timeoutSec = (args.timeout_seconds as number) || 25;
+            const useAreaBoundary = args.use_area_boundary !== false;
+            const rawLimit = typeof args.limit === 'number' ? Math.floor(args.limit) : 200;
+            const limit = Math.max(1, Math.min(1000, rawLimit));
+            const offset = Math.max(0, typeof args.offset === 'number' ? Math.floor(args.offset) : 0);
+
+            if (args.radius_meters !== undefined && (typeof args.radius_meters !== 'number' || !Number.isFinite(args.radius_meters) || args.radius_meters <= 0)) {
+                return { content: [{ type: "text", text: "Error: 'radius_meters' must be a positive number." }], isError: true };
+            }
+
+            const warnings: string[] = [];
+            const coreQuery = includeCrossings
+                ? 'nwr["highway"~"^(traffic_signals|stop)$"]; nwr["highway"="crossing"]["crossing"="traffic_signals"]; nwr["highway"="crossing"]["crossing:signals"="yes"]'
+                : 'nwr["highway"~"^(traffic_signals|stop)$"]';
+            const outDirective = countOnly ? "out tags;" : "out center;";
+
+            let overpassQuery: string;
+            let searchMode: 'route_corridor' | 'circle' | 'area' | 'bbox';
+            let searchModeLabel: string;
+            let refPoint: { lat: number; lng: number; description: string };
+            let bboxObj: BBox | undefined;
+            let geocodeRes: GeocodeResult | undefined;
+            let usedAreaId: number | undefined;
+            let effectiveRadius: number | undefined = typeof args.radius_meters === 'number' ? args.radius_meters : undefined;
+            let routeCoordsLngLat: number[][] | undefined;
+            let routeSummary: Record<string, unknown> | undefined;
+
+            const originInput = typeof args.origin === 'string' ? args.origin.trim() : '';
+            const destInput = typeof args.destination === 'string' ? args.destination.trim() : '';
+            if ((originInput && !destInput) || (!originInput && destInput)) {
+                return {
+                    content: [{ type: "text", text: "Error: Both 'origin' and 'destination' are required when evaluating traffic controls along a route." }],
+                    isError: true
+                };
+            }
+
+            if (args.route_geometry !== undefined || (originInput && destInput)) {
+                if (args.route_geometry !== undefined) {
+                    try {
+                        routeCoordsLngLat = parseRouteCoordinates(args.route_geometry);
+                    } catch (err: any) {
+                        return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
+                    }
+                    const lats = routeCoordsLngLat.map(c => c[1]);
+                    const lngs = routeCoordsLngLat.map(c => c[0]);
+                    bboxObj = ensureValidBBox(safeMin(lats), safeMin(lngs), safeMax(lats), safeMax(lngs));
+                    refPoint = {
+                        lat: routeCoordsLngLat[0][1],
+                        lng: routeCoordsLngLat[0][0],
+                        description: "route start point"
+                    };
+                } else {
+                    const profile = (args.profile as "driving" | "walking" | "cycling") || "driving";
+                    let routeRes;
+                    try {
+                        routeRes = await fetchOsrmRoute(originInput, destInput, profile, false, warnings);
+                    } catch (err: any) {
+                        return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
+                    }
+                    routeCoordsLngLat = routeRes.geomCoords;
+                    bboxObj = routeRes.routeBBox;
+                    refPoint = {
+                        lat: routeRes.start.lat,
+                        lng: routeRes.start.lng,
+                        description: `route start (${routeRes.start.label})`
+                    };
+                    routeSummary = {
+                        profile: routeRes.profile,
+                        origin: routeRes.start,
+                        destination: routeRes.end,
+                        distance_meters: routeRes.distanceMeters,
+                        distance_km: Math.round((routeRes.distanceMeters / 1000) * 100) / 100,
+                        duration_seconds: routeRes.durationSeconds,
+                        duration_minutes: routeRes.durationMinutes
+                    };
+                }
+
+                const corridorRadius = effectiveRadius ?? 20;
+                effectiveRadius = corridorRadius;
+                const sampled = downsampleRouteCoords(routeCoordsLngLat);
+                if (sampled.length < routeCoordsLngLat.length) {
+                    warnings.push(`Route polyline downsampled from ${routeCoordsLngLat.length} to ${sampled.length} vertices for Overpass corridor query.`);
+                }
+                const coordList = sampled.map(([lng, lat]) => `${lat.toFixed(6)},${lng.toFixed(6)}`).join(',');
+                const formattedCore = applySpatialFilter(coreQuery, `(around:${corridorRadius},${coordList})`);
+                overpassQuery = `[out:json][timeout:${timeoutSec}];\n(${formattedCore});\n${outDirective}`;
+
+                searchMode = 'route_corridor';
+                searchModeLabel = routeSummary
+                    ? `route corridor (${routeSummary.profile}: ${(routeSummary as any).origin.label} → ${(routeSummary as any).destination.label}, ${routeSummary.distance_km} km / ${routeSummary.duration_minutes} min, ${corridorRadius}m buffer)`
+                    : `route corridor (${corridorRadius}m buffer around ${routeCoordsLngLat.length}-point route)`;
+            } else {
+                if (args.location) {
+                    try {
+                        geocodeRes = await geocodeLocation(args.location as string);
+                        bboxObj = geocodeRes.bbox;
+                        refPoint = {
+                            lat: geocodeRes.center.lat,
+                            lng: geocodeRes.center.lng,
+                            description: `geocoded center of "${geocodeRes.matched_place}"`
+                        };
+                        if (!effectiveRadius && useAreaBoundary && geocodeRes.osm_area_id) {
+                            usedAreaId = geocodeRes.osm_area_id;
+                        }
+                    } catch (err: any) {
+                        if (args.bbox) {
+                            log('warn', `Geocoding failed for check_traffic_controls, falling back to bbox`, { error: err.message });
+                            bboxObj = parseBBox(args.bbox as string, warnings);
+                            refPoint = {
+                                lat: (bboxObj.lat1 + bboxObj.lat2) / 2,
+                                lng: (bboxObj.lng1 + bboxObj.lng2) / 2,
+                                description: "centroid of provided bounding box"
+                            };
+                        } else {
+                            return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
+                        }
+                    }
+                } else if (args.bbox) {
+                    bboxObj = parseBBox(args.bbox as string, warnings);
+                    const isPoint = Math.abs(bboxObj.lat2 - bboxObj.lat1) < 1e-7 && Math.abs(bboxObj.lng2 - bboxObj.lng1) < 1e-7;
+                    refPoint = {
+                        lat: (bboxObj.lat1 + bboxObj.lat2) / 2,
+                        lng: (bboxObj.lng1 + bboxObj.lng2) / 2,
+                        description: isPoint ? `coordinate (${bboxObj.lat1.toFixed(5)}, ${bboxObj.lng1.toFixed(5)})` : "centroid of provided bounding box"
+                    };
+                    if (isPoint && effectiveRadius === undefined) {
+                        effectiveRadius = 35;
+                    }
+                } else {
+                    return { content: [{ type: "text", text: "Error: One of 'location', 'bbox', 'route_geometry', or 'origin'+'destination' must be provided." }], isError: true };
+                }
+
+                // If geocoded result collapsed to a point without an admin area, default to junction radius
+                if (!effectiveRadius && !usedAreaId && bboxObj && Math.abs(bboxObj.lat2 - bboxObj.lat1) < 1e-7 && Math.abs(bboxObj.lng2 - bboxObj.lng1) < 1e-7) {
+                    effectiveRadius = 35;
+                }
+
+                if (effectiveRadius !== undefined) {
+                    const circleFilter = `(around:${effectiveRadius},${refPoint.lat},${refPoint.lng})`;
+                    const formattedCore = applySpatialFilter(coreQuery, circleFilter);
+                    overpassQuery = `[out:json][timeout:${timeoutSec}];\n(${formattedCore});\n${outDirective}`;
+                    searchMode = 'circle';
+                    searchModeLabel = `circle — ${effectiveRadius}m radius around (${refPoint.lat.toFixed(5)}, ${refPoint.lng.toFixed(5)})`;
+                } else if (usedAreaId) {
+                    const formattedCore = applySpatialFilter(coreQuery, "(area.searchArea)");
+                    overpassQuery = `[out:json][timeout:${timeoutSec}];\narea(${usedAreaId})->.searchArea;\n(${formattedCore});\n${outDirective}`;
+                    searchMode = 'area';
+                    searchModeLabel = `exact OSM boundary area (id: ${usedAreaId}) for "${geocodeRes?.matched_place}"`;
+                } else {
+                    const formattedCore = applySpatialFilter(coreQuery, "");
+                    overpassQuery = `[out:json][timeout:${timeoutSec}][bbox:${bboxObj!.lat1},${bboxObj!.lng1},${bboxObj!.lat2},${bboxObj!.lng2}];\n(${formattedCore});\n${outDirective}`;
+                    searchMode = 'bbox';
+                    searchModeLabel = `bounding box`;
+                }
+
+                if (args.location && effectiveRadius === undefined && useAreaBoundary && !usedAreaId && geocodeRes) {
+                    warnings.push(`Exact admin boundary polygon unavailable for '${geocodeRes.matched_place}', fell back to bounding box query.`);
+                }
+            }
+
+            log('info', `check_traffic_controls starting`, { searchMode, countOnly, includeCrossings, radius_meters: effectiveRadius, timeoutSec });
+
+            const { data, provenance, remarkWarning } = await executeOverpassQuery(overpassQuery, timeoutSec);
+            if (remarkWarning) {
+                warnings.push(`Overpass remark: ${remarkWarning}`);
+            }
+
+            const seenIds = new Set<string>();
+            const allSignals: any[] = [];
+            const allStops: any[] = [];
+            const allMatched: any[] = [];
+
+            for (const e of (data.elements || [])) {
+                const dedupKey = `${e.type}/${e.id}`;
+                if (seenIds.has(dedupKey)) continue;
+                seenIds.add(dedupKey);
+
+                const kind = classifyTrafficControlElement(e, includeCrossings);
+                if (!kind) continue;
+
+                const lat = e.lat ?? e.center?.lat ?? e.geometry?.[0]?.lat;
+                const lon = e.lon ?? e.center?.lon ?? e.geometry?.[0]?.lon;
+
+                if (!countOnly && (lat === undefined || lon === undefined)) {
+                    continue;
+                }
+
+                const entry: any = {
+                    id: e.id,
+                    type: e.type,
+                    control: kind,
+                    ...(e.tags?.name ? { name: e.tags.name } : {}),
+                    tags: e.tags || {}
+                };
+
+                if (lat !== undefined && lon !== undefined) {
+                    entry.coordinates = { lat, lon };
+                    entry.distance_meters = Math.round(calculateHaversineDistanceMeters(refPoint.lat, refPoint.lng, lat, lon) * 10) / 10;
+                    if (routeCoordsLngLat) {
+                        const proj = projectPointOntoRoute(lat, lon, routeCoordsLngLat);
+                        entry.distance_to_route_meters = proj.distanceToRouteMeters;
+                        entry.distance_along_route_meters = proj.distanceAlongRouteMeters;
+                    }
+                }
+
+                allMatched.push(entry);
+                if (kind === 'traffic_signal') {
+                    allSignals.push(entry);
+                } else {
+                    allStops.push(entry);
+                }
+            }
+
+            const counts = {
+                traffic_signals: allSignals.length,
+                stop_signs: allStops.length,
+                total: allMatched.length
+            };
+            const hasTrafficSignal = counts.traffic_signals > 0;
+            const hasStopSign = counts.stop_signs > 0;
+            const controlType: 'traffic_signals' | 'stop_sign' | 'both' | 'none' =
+                hasTrafficSignal && hasStopSign ? 'both'
+                : hasTrafficSignal ? 'traffic_signals'
+                : hasStopSign ? 'stop_sign'
+                : 'none';
+
+            if (countOnly) {
+                const shareUrl = searchMode === 'route_corridor'
+                    ? buildShareUrlWithRoute(bboxObj!, routeCoordsLngLat!, [])
+                    : searchMode === 'circle'
+                        ? buildShareUrlCircleWithMarkers(refPoint, effectiveRadius!, [])
+                        : buildShareUrl(bboxObj || geocodeRes!.bbox);
+
+                const payload = {
+                    search_mode: searchMode,
+                    count_only: true,
+                    ...(geocodeRes ? { matched_place: geocodeRes.matched_place, alternatives: geocodeRes.alternatives } : {}),
+                    ...(usedAreaId ? { osm_area_id: usedAreaId } : {}),
+                    has_traffic_signal: hasTrafficSignal,
+                    has_stop_sign: hasStopSign,
+                    control_type: controlType,
+                    counts,
+                    distance_from: refPoint,
+                    ...(routeSummary ? { route_summary: routeSummary } : {}),
+                    share_url: shareUrl,
+                    provenance,
+                    complete: !remarkWarning,
+                    warnings
+                };
+
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Traffic control check (${searchModeLabel}):\n- Control type: ${controlType}\n- Traffic signals: ${counts.traffic_signals} (${hasTrafficSignal ? 'yes' : 'no'})\n- Stop signs: ${counts.stop_signs} (${hasStopSign ? 'yes' : 'no'})\n\nView on map: ${shareUrl}${formatWarnings(warnings)}`
+                    }],
+                    structuredContent: payload
+                };
+            }
+
+            allMatched.sort((a, b) => {
+                if (searchMode === 'route_corridor') {
+                    const alongDiff = (a.distance_along_route_meters ?? 0) - (b.distance_along_route_meters ?? 0);
+                    if (Math.abs(alongDiff) > 0.001) return alongDiff;
+                    const lateralDiff = (a.distance_to_route_meters ?? 0) - (b.distance_to_route_meters ?? 0);
+                    if (Math.abs(lateralDiff) > 0.001) return lateralDiff;
+                } else {
+                    const distDiff = (a.distance_meters ?? 0) - (b.distance_meters ?? 0);
+                    if (Math.abs(distDiff) > 0.001) return distDiff;
+                }
+                const typeDiff = (a.type || "").localeCompare(b.type || "");
+                if (typeDiff !== 0) return typeDiff;
+                return (a.id ?? 0) - (b.id ?? 0);
+            });
+
+            const paged = allMatched.slice(offset, offset + limit);
+            const pagedSignals = paged.filter(e => e.control === 'traffic_signal');
+            const pagedStops = paged.filter(e => e.control === 'stop_sign');
+            const truncated = allMatched.length > offset + limit;
+            const hasMore = truncated;
+            const nextOffset = hasMore ? offset + limit : undefined;
+
+            const toMarker = (e: any) => ({
+                coordinates: e.coordinates,
+                name: e.control === 'traffic_signal'
+                    ? (e.name ? `Signal: ${e.name}` : 'Traffic Signal')
+                    : (e.name ? `Stop: ${e.name}` : 'Stop Sign')
+            });
+            // Keep both signal and stop-sign pins visible within the 30-marker URL cap
+            const markerList = (pagedSignals.length > 0 && pagedStops.length > 0)
+                ? [...pagedSignals.slice(0, 15), ...pagedStops.slice(0, 15)].map(toMarker)
+                : paged.slice(0, 30).map(toMarker);
+
+            const shareUrl = searchMode === 'route_corridor'
+                ? buildShareUrlWithRoute(bboxObj!, routeCoordsLngLat!, markerList)
+                : searchMode === 'circle'
+                    ? buildShareUrlCircleWithMarkers(refPoint, effectiveRadius!, markerList)
+                    : (searchMode === 'area' && !args.bbox && markerList.length > 0
+                        ? buildShareUrlMarkersOnly(markerList)
+                        : buildShareUrlWithMarkers(bboxObj || geocodeRes!.bbox, markerList));
+
+            const returnedCounts = {
+                traffic_signals: pagedSignals.length,
+                stop_signs: pagedStops.length,
+                total: paged.length
+            };
+
+            log('info', `check_traffic_controls completed`, { searchMode, counts, returnedCounts, truncated });
+
+            const payload: Record<string, unknown> = {
+                search_mode: searchMode,
+                count_only: false,
+                ...(geocodeRes ? { matched_place: geocodeRes.matched_place, alternatives: geocodeRes.alternatives } : {}),
+                ...(usedAreaId ? { osm_area_id: usedAreaId } : {}),
+                has_traffic_signal: hasTrafficSignal,
+                has_stop_sign: hasStopSign,
+                control_type: controlType,
+                counts,
+                distance_from: refPoint,
+                ...(routeSummary ? { route_summary: routeSummary } : {}),
+                traffic_signals: pagedSignals,
+                stop_signs: pagedStops,
+                returned_counts: returnedCounts,
+                offset,
+                limit,
+                truncated,
+                has_more: hasMore,
+                ...(nextOffset !== undefined ? { next_offset: nextOffset } : {}),
+                share_url: shareUrl,
+                provenance,
+                complete: !truncated && !remarkWarning,
+                warnings
+            };
+
+            const previewLines = paged.slice(0, 6).map(e => {
+                const label = e.control === 'traffic_signal' ? 'Traffic Signal' : 'Stop Sign';
+                const distInfo = searchMode === 'route_corridor'
+                    ? `${e.distance_along_route_meters}m along route (${e.distance_to_route_meters}m off centerline)`
+                    : `${e.distance_meters}m away`;
+                return `- [${label}] (${e.coordinates.lat.toFixed(5)}, ${e.coordinates.lon.toFixed(5)}) — ${distInfo}`;
+            }).join('\n');
+            const moreNote = paged.length > 6 ? `\n  … and ${paged.length - 6} more on this page` : '';
+
+            return {
+                content: [{
+                    type: "text",
+                    text: `Traffic control check (${searchModeLabel}):\n- Control type: ${controlType}\n- Traffic signals: ${counts.traffic_signals} (${hasTrafficSignal ? 'yes' : 'no'})\n- Stop signs: ${counts.stop_signs} (${hasStopSign ? 'yes' : 'no'})\n${previewLines ? `\nResults:\n${previewLines}${moreNote}\n` : ''}\nView on map: ${shareUrl}${formatWarnings(warnings)}`
+                }],
+                structuredContent: payload
+            };
         }
 
         else {

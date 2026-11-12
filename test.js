@@ -33,6 +33,27 @@ test("MCP Server Test Suite", async (t) => {
                             { type: "count", id: 0, tags: { nodes: "12", ways: "35", relations: "2", total: "49" } }
                         ]
                     }));
+                } else if (decoded.includes("traffic_signals")) {
+                    const includeCoords = !decoded.includes("out tags;");
+                    const baseElements = [
+                        { type: "node", id: 2001, ...(includeCoords ? { lat: 40.75802, lon: -73.98552 } : {}), tags: { highway: "traffic_signals" } },
+                        { type: "node", id: 2002, ...(includeCoords ? { lat: 40.75840, lon: -73.98510 } : {}), tags: { highway: "stop", direction: "forward" } },
+                        { type: "node", id: 2003, ...(includeCoords ? { lat: 40.75910, lon: -73.98440 } : {}), tags: { highway: "traffic_signals", name: "Broadway & 47th" } }
+                    ];
+                    if (decoded.includes("crossing")) {
+                        baseElements.push({
+                            type: "node",
+                            id: 2004,
+                            ...(includeCoords ? { lat: 40.75815, lon: -73.98535 } : {}),
+                            tags: { highway: "crossing", crossing: "traffic_signals" }
+                        });
+                    }
+                    res.end(JSON.stringify({
+                        version: 0.6,
+                        generator: "Overpass API 0.7.62",
+                        osm3s: { timestamp_osm_base: "2026-11-03T00:00:00Z" },
+                        elements: baseElements
+                    }));
                 } else {
                     res.end(JSON.stringify({
                         version: 0.6,
@@ -99,7 +120,8 @@ test("MCP Server Test Suite", async (t) => {
                 "aggregate_overpass_h3",
                 "calculate_route",
                 "get_elevation",
-                "spatial_calc"
+                "spatial_calc",
+                "check_traffic_controls"
             ]
         );
         for (const tool of tools.tools) {
@@ -631,6 +653,150 @@ test("MCP Server Test Suite", async (t) => {
         assert.ok(Array.isArray(routeJson.route_geometry?.coordinates));
         assert.ok(routeJson.route_geometry.coordinates.length >= 2);
         assert.ok(routeJson.share_url.includes("vibhorsingh.com/boundingbox/#|PB:"), `Expected #|PB: drawn route path (without orange bbox) in share_url, got ${routeJson.share_url}`);
+
+        // Alternatives + return_steps (with maneuver location)
+        const altRes = await client.callTool({
+            name: "calculate_route",
+            arguments: {
+                origin: "40.7128,-74.0060",
+                destination: "40.7580,-73.9855",
+                profile: "driving",
+                return_steps: true,
+                alternatives: true
+            }
+        });
+        assert.strictEqual(altRes.isError, undefined);
+        const altJson = altRes.structuredContent;
+        assert.ok(Array.isArray(altJson.steps) && altJson.steps.length > 0);
+        assert.ok(typeof altJson.steps[0].location?.lat === "number" && typeof altJson.steps[0].location?.lng === "number");
+        assert.strictEqual(typeof altJson.alternatives_count, "number");
+        assert.ok(Array.isArray(altJson.alternatives));
+        assert.strictEqual(altJson.alternatives_count, altJson.alternatives.length);
+        if (altJson.alternatives.length > 0) {
+            assert.strictEqual(altJson.alternatives[0].route_geometry?.type, "LineString");
+            assert.ok(altJson.alternatives[0].share_url.includes("#|PB:"));
+        }
+
+        // Waypoints (plus warning when combined with alternatives: true)
+        const wpRes = await client.callTool({
+            name: "calculate_route",
+            arguments: {
+                origin: "40.7128,-74.0060",
+                destination: "40.7580,-73.9855",
+                waypoints: ["40.7350,-73.9950"],
+                profile: "driving",
+                return_steps: true,
+                alternatives: true
+            }
+        });
+        assert.strictEqual(wpRes.isError, undefined);
+        const wpJson = wpRes.structuredContent;
+        assert.strictEqual(wpJson.waypoints?.length, 1);
+        assert.ok(Array.isArray(wpJson.steps) && wpJson.steps.length > 0);
+        assert.ok(wpJson.share_url.includes("WP%201"), `Expected WP 1 pin in share_url, got ${wpJson.share_url}`);
+        assert.ok(wpJson.warnings.some(w => w.includes("does not support alternative routes when waypoints are provided")));
+
+        // Invalid waypoint returns error
+        const badWpRes = await client.callTool({
+            name: "calculate_route",
+            arguments: {
+                origin: "40.7128,-74.0060",
+                destination: "40.7580,-73.9855",
+                waypoints: [""]
+            }
+        });
+        assert.strictEqual(badWpRes.isError, true);
+    });
+
+    await t.test("check_traffic_controls - junction point, bbox count/coords, route corridor, and crossings", async () => {
+        // 1. Single point defaults to 35m junction radius and returns both traffic signals and stop signs
+        const junctionRes = await client.callTool({
+            name: "check_traffic_controls",
+            arguments: { bbox: "40.7580,-73.9855" }
+        });
+        assert.strictEqual(junctionRes.isError, undefined);
+        const junctionJson = junctionRes.structuredContent;
+        assert.strictEqual(junctionJson.search_mode, "circle");
+        assert.strictEqual(junctionJson.has_traffic_signal, true);
+        assert.strictEqual(junctionJson.has_stop_sign, true);
+        assert.strictEqual(junctionJson.control_type, "both");
+        assert.strictEqual(junctionJson.counts.traffic_signals, 2);
+        assert.strictEqual(junctionJson.counts.stop_signs, 1);
+        assert.strictEqual(junctionJson.counts.total, 3);
+        assert.ok(junctionJson.traffic_signals[0].coordinates.lat);
+        assert.ok(junctionJson.stop_signs[0].coordinates.lon);
+        assert.ok(junctionJson.share_url.includes("#C:"));
+
+        // 2. Bounding box count_only mode returns separate counts & booleans without feature arrays
+        const countRes = await client.callTool({
+            name: "check_traffic_controls",
+            arguments: { bbox: "40.757,-73.987,40.760,-73.983", count_only: true }
+        });
+        assert.strictEqual(countRes.isError, undefined);
+        const countJson = countRes.structuredContent;
+        assert.strictEqual(countJson.search_mode, "bbox");
+        assert.strictEqual(countJson.count_only, true);
+        assert.strictEqual(countJson.counts.traffic_signals, 2);
+        assert.strictEqual(countJson.counts.stop_signs, 1);
+        assert.strictEqual(countJson.traffic_signals, undefined);
+
+        // 3. Route corridor mode accepts LineString geometry, computes along-route distances, and plots route + markers
+        const routeCtrlRes = await client.callTool({
+            name: "check_traffic_controls",
+            arguments: {
+                route_geometry: {
+                    type: "LineString",
+                    coordinates: [
+                        [-73.98555, 40.75795],
+                        [-73.98435, 40.75915]
+                    ]
+                },
+                radius_meters: 25,
+                include_crossings: true
+            }
+        });
+        assert.strictEqual(routeCtrlRes.isError, undefined);
+        const routeCtrlJson = routeCtrlRes.structuredContent;
+        assert.strictEqual(routeCtrlJson.search_mode, "route_corridor");
+        assert.strictEqual(routeCtrlJson.counts.traffic_signals, 3); // 2 signals + 1 signalized crossing
+        assert.strictEqual(routeCtrlJson.counts.stop_signs, 1);
+        assert.ok(typeof routeCtrlJson.traffic_signals[0].distance_along_route_meters === "number");
+        assert.ok(typeof routeCtrlJson.traffic_signals[0].distance_to_route_meters === "number");
+        assert.ok(routeCtrlJson.traffic_signals[0].distance_along_route_meters <= routeCtrlJson.traffic_signals[1].distance_along_route_meters);
+        assert.ok(routeCtrlJson.share_url.includes("#|PB:"), `Expected route + markers in share_url, got ${routeCtrlJson.share_url}`);
+
+        // 4. Direct origin + destination routing mode on check_traffic_controls
+        const missingDestRes = await client.callTool({
+            name: "check_traffic_controls",
+            arguments: { origin: "40.7559,-73.9869" }
+        });
+        assert.strictEqual(missingDestRes.isError, true);
+        assert.ok(missingDestRes.content[0].text.includes("Both 'origin' and 'destination'"));
+
+        const directRouteRes = await client.callTool({
+            name: "check_traffic_controls",
+            arguments: {
+                origin: "40.7559,-73.9869",
+                destination: "40.7614,-73.9776",
+                profile: "driving"
+            }
+        });
+        assert.strictEqual(directRouteRes.isError, undefined);
+        const directRouteJson = directRouteRes.structuredContent;
+        assert.strictEqual(directRouteJson.search_mode, "route_corridor");
+        assert.strictEqual(directRouteJson.route_summary?.profile, "driving");
+        assert.ok(directRouteJson.route_summary?.distance_meters > 0);
+        assert.ok(directRouteJson.counts.total > 0);
+        assert.ok(directRouteJson.share_url.includes("#|PB:"), `Expected route + markers in share_url, got ${directRouteJson.share_url}`);
+
+        // 5. Built-in list_osm_tags recognizes traffic light queries
+        const tagRes = await client.callTool({
+            name: "list_osm_tags",
+            arguments: { category: "traffic light" }
+        });
+        assert.strictEqual(tagRes.isError, undefined);
+        assert.strictEqual(tagRes.structuredContent.source, "built-in");
+        assert.ok(tagRes.structuredContent.recommendations_text.includes("traffic_signals"));
     });
 
     await t.test("concurrency & Overpass runtime-error regression tests with local mock server", async () => {
