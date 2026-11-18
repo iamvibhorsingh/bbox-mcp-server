@@ -13,3 +13,4 @@ mcpb-build/server/
 *.geojson
 *.html
 *.cjs
+.claude

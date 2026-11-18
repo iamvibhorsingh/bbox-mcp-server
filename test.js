@@ -3,12 +3,398 @@ import assert from "node:assert";
 import http from "node:http";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { parquetWriteBuffer } from "hyparquet-writer";
+
+function makePlaceRow(overrides) {
+    const lat = overrides.lat;
+    const lon = overrides.lon;
+    return {
+        id: overrides.id,
+        geometry: { type: "Point", coordinates: [lon, lat] },
+        bbox: { xmin: lon, xmax: lon, ymin: lat, ymax: lat },
+        confidence: overrides.confidence ?? 0.9,
+        operating_status: overrides.operating_status ?? "open",
+        basic_category: overrides.basic_category ?? "coffee_shop",
+        taxonomy: overrides.taxonomy ?? {
+            primary: overrides.basic_category ?? "coffee_shop",
+            alternates: ["cafe"],
+            hierarchy: ["eat_and_drink", overrides.basic_category ?? "coffee_shop"]
+        },
+        names: {
+            primary: overrides.name,
+            common: { en: overrides.commonName ?? overrides.name }
+        },
+        brand: overrides.brand ?? { names: { primary: overrides.brandName ?? "Indie" }, wikidata: "Q0" },
+        addresses: [{
+            freeform: overrides.address ?? "100 Main St",
+            locality: overrides.locality ?? "New York",
+            postcode: overrides.postcode ?? "10036",
+            region: overrides.region ?? "NY",
+            country: overrides.country ?? "US"
+        }],
+        websites: overrides.websites ?? ["https://example.com"],
+        phones: overrides.phones ?? ["+12125550100"],
+        emails: overrides.emails ?? ["info@example.com"],
+        socials: overrides.socials ?? ["https://social.example/place"],
+        sources: overrides.sources ?? [{ property: "", dataset: "meta" }],
+        version: overrides.version ?? 1
+    };
+}
+
+function buildPlaceParquetBuffer(places, rowGroupSize = 100) {
+    const columnNames = [
+        "id", "geometry", "bbox", "confidence", "operating_status",
+        "basic_category", "taxonomy", "names", "brand", "addresses",
+        "websites", "phones", "emails", "socials", "sources", "version"
+    ];
+    return Buffer.from(parquetWriteBuffer({
+        rowGroupSize,
+        columnData: columnNames.map((name) => ({
+            name,
+            data: places.map((p) => p[name]),
+            ...(name === "geometry" ? { type: "GEOMETRY" } : {})
+        }))
+    }));
+}
+
+function buildCollectionsParquetBuffer(entries) {
+    return Buffer.from(parquetWriteBuffer({
+        columnData: [
+            { name: "collection", data: entries.map((e) => e.collection) },
+            { name: "id", data: entries.map((e) => e.id) },
+            { name: "bbox", data: entries.map((e) => e.bbox) },
+            { name: "assets", data: entries.map((e) => e.assets) }
+        ]
+    }));
+}
+
+function decodeGooglePolyline(encoded) {
+    const raw = decodeURIComponent(encoded).replace(/!/g, "|");
+    const pts = [];
+    let index = 0;
+    let lat = 0;
+    let lng = 0;
+    const readSigned = () => {
+        let result = 0;
+        let shift = 0;
+        let b;
+        do {
+            b = raw.charCodeAt(index++) - 63;
+            result |= (b & 0x1f) << shift;
+            shift += 5;
+        } while (b >= 0x20);
+        return (result & 1) ? ~(result >>> 1) : (result >>> 1);
+    };
+    while (index < raw.length) {
+        lat += readSigned();
+        lng += readSigned();
+        pts.push([Number((lat / 1e5).toFixed(5)), Number((lng / 1e5).toFixed(5))]);
+    }
+    return pts;
+}
+
+function parseShareUrlPolylinePoints(shareUrl) {
+    const hash = new URL(shareUrl).hash.replace(/^#/, "");
+    const parts = hash.split(/\||%7C/i);
+    const lbePart = parts.find((p) => p.startsWith("LBE:"));
+    if (lbePart) {
+        return decodeGooglePolyline(lbePart.slice(4));
+    }
+    const lbPart = parts.find((p) => p.startsWith("LB:"));
+    if (!lbPart) return null;
+    const nums = lbPart.slice(3).split(",").map(Number);
+    const pts = [];
+    for (let i = 0; i + 1 < nums.length; i += 2) {
+        pts.push([nums[i], nums[i + 1]]);
+    }
+    return pts;
+}
+
+function serveBufferWithRange(req, res, buffer, contentType = "application/vnd.apache.parquet") {
+    if (req.method === "HEAD") {
+        res.writeHead(200, {
+            "Content-Type": contentType,
+            "Content-Length": String(buffer.byteLength),
+            "Accept-Ranges": "bytes"
+        });
+        res.end();
+        return;
+    }
+    const rangeHeader = req.headers.range;
+    if (typeof rangeHeader === "string") {
+        const match = /^bytes=(\d+)-(\d*)$/.exec(rangeHeader.trim());
+        if (!match) {
+            res.writeHead(416, { "Content-Range": `bytes */${buffer.byteLength}` });
+            res.end();
+            return;
+        }
+        const start = Number(match[1]);
+        const rawEnd = match[2] ? Number(match[2]) : buffer.byteLength - 1;
+        const end = Math.min(rawEnd, buffer.byteLength - 1);
+        if (start >= buffer.byteLength || end < start) {
+            res.writeHead(416, { "Content-Range": `bytes */${buffer.byteLength}` });
+            res.end();
+            return;
+        }
+        const slice = buffer.subarray(start, end + 1);
+        res.writeHead(206, {
+            "Content-Type": contentType,
+            "Content-Range": `bytes ${start}-${end}/${buffer.byteLength}`,
+            "Content-Length": String(slice.byteLength),
+            "Accept-Ranges": "bytes"
+        });
+        res.end(slice);
+        return;
+    }
+    res.writeHead(200, {
+        "Content-Type": contentType,
+        "Content-Length": String(buffer.byteLength),
+        "Accept-Ranges": "bytes"
+    });
+    res.end(buffer);
+}
 
 test("MCP Server Test Suite", async (t) => {
     const nominatimRequestTimes = [];
+    const overtureStats = { londonAwsHits: 0, londonAzureHits: 0 };
+
+    const nycParquet = buildPlaceParquetBuffer([
+        makePlaceRow({
+            id: "place-blue-bottle",
+            name: "Blue Bottle Coffee",
+            lat: 40.7565,
+            lon: -73.9860,
+            confidence: 0.96,
+            basic_category: "coffee_shop",
+            taxonomy: { primary: "coffee_shop", alternates: ["cafe"], hierarchy: ["eat_and_drink", "coffee_and_tea", "coffee_shop"] },
+            brand: { names: { primary: "Blue Bottle" }, wikidata: "Q4928901" },
+            address: "1345 Avenue of the Americas",
+            websites: ["https://bluebottlecoffee.com"],
+            phones: ["+15106533394"],
+            emails: ["hello@bluebottlecoffee.com"],
+            socials: ["https://instagram.com/bluebottle"],
+            sources: [{ property: "", dataset: "Overture" }, { property: "/names", dataset: "meta" }, { property: "/websites", dataset: "Foursquare" }],
+            version: 2
+        }),
+        makePlaceRow({
+            id: "place-starbucks",
+            name: "Starbucks Reserve",
+            lat: 40.7555,
+            lon: -73.9855,
+            confidence: 0.92,
+            basic_category: "coffee_shop",
+            taxonomy: { primary: "coffee_shop", alternates: ["bakery"], hierarchy: ["eat_and_drink", "coffee_shop"] },
+            brand: { names: { primary: "Starbucks" }, wikidata: "Q37158" },
+            address: "1585 Broadway",
+            websites: ["https://starbucks.com"],
+            phones: ["+12125550101"],
+            emails: [],
+            socials: [],
+            sources: [{ property: "", dataset: "Microsoft" }],
+            version: 1
+        }),
+        makePlaceRow({
+            id: "place-barber",
+            name: "Times Barber Shop",
+            lat: 40.7550,
+            lon: -73.9850,
+            confidence: 0.88,
+            basic_category: "barber_shop",
+            taxonomy: { primary: "barber_shop", alternates: ["hair_salon"], hierarchy: ["beauty_and_spa", "barber_shop"] },
+            brand: null,
+            address: "200 W 42nd St",
+            websites: [],
+            phones: [],
+            emails: [],
+            socials: [],
+            sources: [{ property: "", dataset: "meta" }]
+        }),
+        makePlaceRow({
+            id: "place-jazz-bar",
+            name: "Midnight Jazz Bar",
+            lat: 40.7545,
+            lon: -73.9845,
+            confidence: 0.85,
+            basic_category: "bar",
+            taxonomy: { primary: "bar", alternates: ["cocktail_bar"], hierarchy: ["eat_and_drink", "nightlife", "bar"] },
+            brand: null,
+            address: "700 8th Ave",
+            websites: ["https://midnightjazz.example"],
+            phones: [],
+            emails: [],
+            socials: [],
+            sources: [{ property: "", dataset: "Foursquare" }]
+        }),
+        makePlaceRow({
+            id: "place-closed-cafe",
+            name: "Closed Roastery",
+            lat: 40.7560,
+            lon: -73.9858,
+            confidence: 0.90,
+            operating_status: "permanently_closed",
+            basic_category: "coffee_shop",
+            taxonomy: { primary: "coffee_shop", alternates: [], hierarchy: ["eat_and_drink", "coffee_shop"] },
+            brand: null,
+            address: "1450 Broadway",
+            websites: [],
+            phones: [],
+            emails: [],
+            socials: [],
+            sources: [{ property: "", dataset: "meta" }]
+        }),
+        makePlaceRow({
+            id: "place-low-conf-cafe",
+            name: "Low Conf Espresso",
+            lat: 40.7570,
+            lon: -73.9865,
+            confidence: 0.35,
+            basic_category: "coffee_shop",
+            taxonomy: { primary: "coffee_shop", alternates: [], hierarchy: ["eat_and_drink", "coffee_shop"] },
+            brand: null,
+            address: "100 W 45th St",
+            websites: [],
+            phones: [],
+            emails: [],
+            socials: [],
+            sources: [{ property: "", dataset: "BrightQuery" }]
+        }),
+        makePlaceRow({
+            id: "place-outside-nyc",
+            name: "Far Uptown Cafe",
+            lat: 40.8200,
+            lon: -73.9500,
+            confidence: 0.99,
+            basic_category: "coffee_shop",
+            taxonomy: { primary: "coffee_shop", alternates: [], hierarchy: ["eat_and_drink", "coffee_shop"] },
+            brand: null,
+            address: "500 W 140th St",
+            websites: [],
+            phones: [],
+            emails: [],
+            socials: [],
+            sources: [{ property: "", dataset: "meta" }]
+        })
+    ]);
+
+    const londonParquet = buildPlaceParquetBuffer([
+        makePlaceRow({
+            id: "place-london-cafe",
+            name: "Monmouth Coffee Company",
+            lat: 51.5142,
+            lon: -0.1268,
+            confidence: 0.95,
+            basic_category: "coffee_shop",
+            address: "27 Monmouth St",
+            locality: "London",
+            postcode: "WC2H 9EU",
+            region: "ENG",
+            country: "GB",
+            websites: ["https://monmouthcoffee.co.uk"],
+            sources: [{ property: "", dataset: "Foursquare" }]
+        })
+    ]);
+
+    const sfManyRgParquet = buildPlaceParquetBuffer([
+        makePlaceRow({ id: "sf-1", name: "SF Cafe 1", lat: 37.775, lon: -122.419, locality: "San Francisco", region: "CA" }),
+        makePlaceRow({ id: "sf-2", name: "SF Cafe 2", lat: 37.776, lon: -122.418, locality: "San Francisco", region: "CA" }),
+        makePlaceRow({ id: "sf-3", name: "SF Cafe 3", lat: 37.777, lon: -122.417, locality: "San Francisco", region: "CA" }),
+        makePlaceRow({ id: "sf-4", name: "SF Cafe 4", lat: 37.778, lon: -122.416, locality: "San Francisco", region: "CA" }),
+        makePlaceRow({ id: "sf-5", name: "SF Cafe 5", lat: 37.779, lon: -122.415, locality: "San Francisco", region: "CA" })
+    ], 1);
+
+    let mockBaseUrl = "";
 
     const mockServer = http.createServer((req, res) => {
-        if (req.url?.startsWith("/reverse")) {
+        const reqPath = (req.url || "").split("?")[0];
+        if (req.url?.startsWith("/search")) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify([{
+                display_name: "Times Square Polygon Area",
+                lat: "40.7558",
+                lon: "-73.9854",
+                boundingbox: ["40.7540", "40.7575", "-73.9870", "-73.9840"],
+                osm_type: "relation",
+                osm_id: "99999",
+                geojson: {
+                    type: "Polygon",
+                    coordinates: [[
+                        [-73.9866, 40.7570],
+                        [-73.9846, 40.7570],
+                        [-73.9846, 40.7550],
+                        [-73.9866, 40.7550],
+                        [-73.9866, 40.7570]
+                    ]]
+                }
+            }]));
+        } else if (reqPath === "/overture/catalog.json" || reqPath === "/overture-fallback/catalog.json") {
+            const prefix = reqPath.startsWith("/overture-fallback") ? "/overture-fallback" : "/overture";
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+                latest: "2026-10-21.0",
+                links: [{ rel: "child", href: `.${prefix === "/overture-fallback" ? "" : ""}/2026-10-21.0/catalog.json` }]
+            }));
+        } else if (reqPath === "/overture/2026-10-21.0/catalog.json" || reqPath === "/overture-fallback/2026-10-21.0/catalog.json") {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ id: "2026-10-21.0", links: [] }));
+        } else if (reqPath === "/overture/2026-10-21.0/collections.parquet") {
+            const collectionsBuf = buildCollectionsParquetBuffer([
+                {
+                    collection: "place",
+                    id: "part-00001",
+                    bbox: { xmin: -74.05, ymin: 40.65, xmax: -73.90, ymax: 40.85 },
+                    assets: {
+                        aws: { href: `${mockBaseUrl}/overture/aws/part-00001.parquet` },
+                        azure: { href: `${mockBaseUrl}/overture/azure/part-00001.parquet` }
+                    }
+                },
+                {
+                    collection: "place",
+                    id: "part-00002",
+                    bbox: { xmin: -0.20, ymin: 51.45, xmax: 0.05, ymax: 51.55 },
+                    assets: {
+                        aws: { href: `${mockBaseUrl}/overture/aws/part-00002.parquet` },
+                        azure: { href: `${mockBaseUrl}/overture/azure/part-00002.parquet` }
+                    }
+                }
+            ]);
+            serveBufferWithRange(req, res, collectionsBuf);
+        } else if (reqPath === "/overture-fallback/2026-10-21.0/collections.parquet") {
+            res.writeHead(404);
+            res.end();
+        } else if (reqPath === "/overture-fallback/2026-10-21.0/places/place/collection.json") {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+                links: [
+                    { rel: "item", href: "./item-nyc.json" },
+                    { rel: "item", href: "./item-sf.json" }
+                ]
+            }));
+        } else if (reqPath === "/overture-fallback/2026-10-21.0/places/place/item-nyc.json") {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+                id: "item-nyc",
+                bbox: [-74.05, 40.65, -73.90, 40.85],
+                assets: { aws: { href: `${mockBaseUrl}/overture/aws/part-00001.parquet` } }
+            }));
+        } else if (reqPath === "/overture-fallback/2026-10-21.0/places/place/item-sf.json") {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+                id: "item-sf",
+                bbox: [-122.45, 37.75, -122.39, 37.81],
+                assets: { aws: { href: `${mockBaseUrl}/overture/aws/part-many-rg.parquet` } }
+            }));
+        } else if (reqPath === "/overture/aws/part-00001.parquet" || reqPath === "/overture/azure/part-00001.parquet") {
+            serveBufferWithRange(req, res, nycParquet);
+        } else if (reqPath === "/overture/aws/part-00002.parquet") {
+            overtureStats.londonAwsHits++;
+            res.writeHead(503);
+            res.end();
+        } else if (reqPath === "/overture/azure/part-00002.parquet") {
+            overtureStats.londonAzureHits++;
+            serveBufferWithRange(req, res, londonParquet);
+        } else if (reqPath === "/overture/aws/part-many-rg.parquet") {
+            serveBufferWithRange(req, res, sfManyRgParquet);
+        } else if (req.url?.startsWith("/reverse")) {
             nominatimRequestTimes.push(Date.now());
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({
@@ -70,6 +456,24 @@ test("MCP Server Test Suite", async (t) => {
                     }));
                 }
             });
+        } else if (reqPath === "/elevation") {
+            const reqUrl = new URL(req.url, mockBaseUrl);
+            const lats = (reqUrl.searchParams.get("latitude") || "").split(",").filter(Boolean).map(Number);
+            const lngs = (reqUrl.searchParams.get("longitude") || "").split(",").filter(Boolean).map(Number);
+            const elevation = lats.map((lat, idx) => {
+                const lng = lngs[idx] ?? 0;
+                if (lat > 39 && lat < 40 && lng < -104) {
+                    return Number((1609 + (lat - 39.73) * 500).toFixed(1));
+                }
+                if (lat >= 35.99 && lat <= 36.11 && lng <= -111.9 && lng >= -112.1) {
+                    const distFromPeak = Math.abs(lat - 36.05);
+                    const ridgeBoost = Math.max(0, 600 * (1 - distFromPeak / 0.04));
+                    return Number((1500 + ridgeBoost).toFixed(1));
+                }
+                return 50;
+            });
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ elevation }));
         } else if (req.url?.startsWith("/overpass-runtime-error")) {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({
@@ -87,14 +491,16 @@ test("MCP Server Test Suite", async (t) => {
 
     await new Promise(resolve => mockServer.listen(0, "127.0.0.1", resolve));
     const port = mockServer.address().port;
-    const mockBaseUrl = `http://127.0.0.1:${port}`;
+    mockBaseUrl = `http://127.0.0.1:${port}`;
 
     const transport = new StdioClientTransport({
         command: "node",
         args: ["./dist/index.js"],
         env: {
             ...process.env,
-            OVERPASS_API_URL: `${mockBaseUrl}/overpass-ok`
+            OVERPASS_API_URL: `${mockBaseUrl}/overpass-ok`,
+            OVERTURE_STAC_URL: `${mockBaseUrl}/overture/catalog.json`,
+            ELEVATION_API_URL: `${mockBaseUrl}/elevation`
         }
     });
 
@@ -121,7 +527,8 @@ test("MCP Server Test Suite", async (t) => {
                 "calculate_route",
                 "get_elevation",
                 "spatial_calc",
-                "check_traffic_controls"
+                "check_traffic_controls",
+                "search_places"
             ]
         );
         for (const tool of tools.tools) {
@@ -298,6 +705,12 @@ test("MCP Server Test Suite", async (t) => {
         assert.strictEqual(result.isError, undefined);
         assert.ok(result.content[0].text.includes("H3 cells generated") || result.content[0].text.includes("H3 Cells"));
         assert.strictEqual(result.structuredContent.complete, true);
+        const { share_url, cells, cell_count } = result.structuredContent;
+        const [resolution, total, ...preview] = share_url.split("|H3:")[1].split(",");
+        assert.equal(resolution, "7");
+        assert.equal(Number(total), cell_count);
+        assert.deepEqual(preview, cells.slice(0, 64));
+        assert.ok(share_url.length <= 3800);
     });
 
     await t.test("get_h3_indices - summary_only mode sets complete=false", async () => {
@@ -503,6 +916,12 @@ test("MCP Server Test Suite", async (t) => {
         assert.ok(jsonResponse.active_hex_count > 0);
         assert.ok(jsonResponse.hex_geojson.type === "FeatureCollection");
         assert.ok(jsonResponse.share_url.includes("|"), "Expected hotspot marker pins in share_url");
+        const density = jsonResponse.share_url.split("|H3:")[1].split("|")[0].split(",").slice(2);
+        assert.ok(density.length > 0);
+        for (const item of density) {
+            const [cell, count] = item.split(".");
+            assert.equal(Number(count), jsonResponse.hex_counts[cell]);
+        }
         assert.strictEqual(jsonResponse.complete, true);
     });
 
@@ -584,9 +1003,93 @@ test("MCP Server Test Suite", async (t) => {
         });
         assert.strictEqual(dbRes.isError, undefined);
         const dbJson = dbRes.structuredContent;
+        assert.strictEqual(dbJson.ellipsoid, "WGS84");
         assert.ok(dbJson.distance_meters > 5000 && dbJson.distance_meters < 6000);
+        assert.ok(typeof dbJson.spherical_distance_meters === "number");
+        assert.ok(typeof dbJson.final_bearing_degrees === "number");
+        assert.ok(dbJson.enu_vector_meters && typeof dbJson.enu_vector_meters.east === "number" && typeof dbJson.enu_vector_meters.north === "number");
         assert.ok(dbJson.cardinal_direction);
-        assert.ok(dbJson.share_url.includes("#|PB:"), `Expected no orange bbox (#|PB:) in distance_bearing share_url, got ${dbJson.share_url}`);
+        assert.ok(dbJson.share_url.includes("#|LB:"), `Expected no orange bbox (#|LB:) in distance_bearing share_url, got ${dbJson.share_url}`);
+        assert.ok(!dbJson.share_url.includes("PB:"), `Expected no legacy PB: polygon trace in distance_bearing share_url`);
+        const dbLinePts = parseShareUrlPolylinePoints(dbJson.share_url);
+        assert.deepStrictEqual(dbLinePts, [
+            [40.7128, -74.006],
+            [40.758, -73.9855]
+        ]);
+
+        // Long-distance WGS84 geodesic midpoint (NYC -> London): true geodesic arches above 52°N, unlike naive arithmetic mean (46.11°N)
+        const nycLonRes = await client.callTool({
+            name: "spatial_calc",
+            arguments: {
+                operation: "distance_bearing",
+                bbox_a: "40.7128,-74.0060",
+                bbox_b: "51.5074,-0.1278"
+            }
+        });
+        assert.strictEqual(nycLonRes.isError, undefined);
+        const nycLonJson = nycLonRes.structuredContent;
+        assert.strictEqual(nycLonJson.ellipsoid, "WGS84");
+        assert.ok(nycLonJson.midpoint.lat > 52.0, `Expected true geodesic midpoint lat > 52.0, got ${nycLonJson.midpoint.lat}`);
+        assert.ok(Math.abs(nycLonJson.final_bearing_degrees - nycLonJson.bearing_degrees) > 20, "Expected forward azimuth to curve over North Atlantic");
+
+        // Camera footprint: nadir (-90 deg) and oblique (-45 deg, East heading) + invalid parameter rejection
+        const nadirCamRes = await client.callTool({
+            name: "spatial_calc",
+            arguments: {
+                operation: "camera_footprint",
+                bbox_a: "40.7484,-73.9857",
+                altitude_meters: 500,
+                pitch_degrees: -90,
+                fov_degrees: 60,
+                aspect_ratio: 1.5
+            }
+        });
+        assert.strictEqual(nadirCamRes.isError, undefined);
+        const nadirJson = nadirCamRes.structuredContent;
+        assert.strictEqual(nadirJson.ellipsoid, "WGS84");
+        assert.ok(nadirJson.area_km2 > 0);
+        assert.ok(nadirJson.footprint_wkt.startsWith("POLYGON(("));
+        assert.strictEqual(nadirJson.footprint_geojson?.geometry?.type, "Polygon");
+        assert.strictEqual(nadirJson.clamped_to_horizon, false);
+        assert.ok(Math.abs(nadirJson.center_target.lat - 40.7484) < 1e-4);
+        assert.ok(Math.abs(nadirJson.center_target.lng - -73.9857) < 1e-4);
+        assert.ok(nadirJson.share_url.includes("#P:"), `Expected #P: polygon in camera_footprint share_url, got ${nadirJson.share_url}`);
+
+        const obliqueCamRes = await client.callTool({
+            name: "spatial_calc",
+            arguments: {
+                operation: "camera_footprint",
+                bbox_a: "40.7484,-73.9857",
+                altitude_meters: 500,
+                pitch_degrees: -45,
+                heading_degrees: 90,
+                fov_degrees: 60
+            }
+        });
+        assert.strictEqual(obliqueCamRes.isError, undefined);
+        const obliqueJson = obliqueCamRes.structuredContent;
+        assert.ok(obliqueJson.center_target.lng > -73.9857, "Expected East-facing camera look target east of camera");
+        assert.ok(obliqueJson.area_km2 > nadirJson.area_km2, "Expected oblique footprint area to exceed nadir footprint area");
+
+        const badPitchRes = await client.callTool({
+            name: "spatial_calc",
+            arguments: {
+                operation: "camera_footprint",
+                bbox_a: "40.7484,-73.9857",
+                altitude_meters: 500,
+                pitch_degrees: 10
+            }
+        });
+        assert.strictEqual(badPitchRes.isError, true);
+
+        const missingAltRes = await client.callTool({
+            name: "spatial_calc",
+            arguments: {
+                operation: "camera_footprint",
+                bbox_a: "40.7484,-73.9857"
+            }
+        });
+        assert.strictEqual(missingAltRes.isError, true);
 
         const splitRes = await client.callTool({
             name: "spatial_calc",
@@ -603,7 +1106,7 @@ test("MCP Server Test Suite", async (t) => {
         assert.strictEqual(splitJson.cells.length, 6);
     });
 
-    await t.test("get_elevation - point lookup and grid sample_stats with 90m DEM resolution", async () => {
+    await t.test("get_elevation - point lookup, grid, line_of_sight, and profile modes", async () => {
         const elevRes = await client.callTool({
             name: "get_elevation",
             arguments: {
@@ -634,9 +1137,71 @@ test("MCP Server Test Suite", async (t) => {
         assert.strictEqual(gridRes.structuredContent.mode, "grid");
         assert.strictEqual(gridRes.structuredContent.sample_stats.is_finite_sample, true);
         assert.ok(gridRes.structuredContent.warnings.some(w => w.includes("90m resolution DEM")));
+
+        // Line of Sight blocked by synthetic ridge peak at 36.05,-112.0 (2100m vs 1500m endpoints)
+        const blockedLosRes = await client.callTool({
+            name: "get_elevation",
+            arguments: {
+                mode: "line_of_sight",
+                origin: "36.0,-112.0",
+                destination: "36.1,-112.0",
+                observer_height_meters: 1.7,
+                target_height_meters: 0,
+                sample_count: 11
+            }
+        });
+        assert.strictEqual(blockedLosRes.isError, undefined, blockedLosRes.content?.[0]?.text);
+        const blockedJson = blockedLosRes.structuredContent;
+        assert.strictEqual(blockedJson.mode, "line_of_sight");
+        assert.strictEqual(blockedJson.line_of_sight.is_visible, false);
+        assert.ok(blockedJson.line_of_sight.max_obstruction_meters > 500, `Expected obstruction > 500m, got ${blockedJson.line_of_sight.max_obstruction_meters}`);
+        assert.ok(Math.abs(blockedJson.line_of_sight.limiting_point.lat - 36.05) < 0.01);
+        assert.ok(blockedJson.share_url.includes("#|LB:"), `Expected #|LB: route in LOS share_url, got ${blockedJson.share_url}`);
+
+        // Elevated observer/drone (700m AGL) clears the synthetic ridge
+        const clearLosRes = await client.callTool({
+            name: "get_elevation",
+            arguments: {
+                mode: "line_of_sight",
+                origin: "36.0,-112.0",
+                destination: "36.1,-112.0",
+                observer_height_meters: 700,
+                target_height_meters: 700,
+                sample_count: 11
+            }
+        });
+        assert.strictEqual(clearLosRes.isError, undefined, clearLosRes.content?.[0]?.text);
+        const clearJson = clearLosRes.structuredContent;
+        assert.strictEqual(clearJson.line_of_sight.is_visible, true);
+        assert.ok(clearJson.line_of_sight.min_clearance_meters > 0);
+
+        // Elevation profile along route_geometry over synthetic ridge
+        const profileRes = await client.callTool({
+            name: "get_elevation",
+            arguments: {
+                mode: "profile",
+                route_geometry: {
+                    type: "LineString",
+                    coordinates: [
+                        [-112.0, 36.0],
+                        [-112.0, 36.05],
+                        [-112.0, 36.1]
+                    ]
+                },
+                sample_count: 11
+            }
+        });
+        assert.strictEqual(profileRes.isError, undefined, profileRes.content?.[0]?.text);
+        const profJson = profileRes.structuredContent;
+        assert.strictEqual(profJson.mode, "profile");
+        assert.ok(profJson.profile_stats.cumulative_gain_meters > 0);
+        assert.ok(profJson.profile_stats.cumulative_loss_meters > 0);
+        assert.ok(profJson.profile_stats.max_incline_grade_percent > 0);
+        assert.ok(profJson.profile_stats.steepest_segment && typeof profJson.profile_stats.steepest_segment.grade_percent === "number");
+        assert.ok(profJson.share_url.includes("#|LB:"));
     });
 
-    await t.test("calculate_route - returns route_geometry LineString and draws route path (PB:) on verification map", async () => {
+    await t.test("calculate_route - returns route_geometry LineString and draws one-way LB: route path on verification map", async () => {
         const routeRes = await client.callTool({
             name: "calculate_route",
             arguments: {
@@ -652,7 +1217,16 @@ test("MCP Server Test Suite", async (t) => {
         assert.strictEqual(routeJson.route_geometry?.type, "LineString");
         assert.ok(Array.isArray(routeJson.route_geometry?.coordinates));
         assert.ok(routeJson.route_geometry.coordinates.length >= 2);
-        assert.ok(routeJson.share_url.includes("vibhorsingh.com/boundingbox/#|PB:"), `Expected #|PB: drawn route path (without orange bbox) in share_url, got ${routeJson.share_url}`);
+        const expectedPrefix = routeJson.route_geometry.coordinates.length > 15 ? "LBE:" : "LB:";
+        assert.ok(routeJson.share_url.includes(`vibhorsingh.com/boundingbox/#|${expectedPrefix}`), `Expected #|${expectedPrefix} one-way drawn route path in share_url, got ${routeJson.share_url}`);
+        assert.ok(!routeJson.share_url.includes("PB:"), `Route share_url should not encode mirrored PB: polygon: ${routeJson.share_url}`);
+        const routeLinePts = parseShareUrlPolylinePoints(routeJson.share_url);
+        assert.ok(routeLinePts && routeLinePts.length >= 2);
+        assert.ok(routeLinePts.length <= 200);
+        const firstCoord = routeJson.route_geometry.coordinates[0];
+        const lastCoord = routeJson.route_geometry.coordinates[routeJson.route_geometry.coordinates.length - 1];
+        assert.deepStrictEqual(routeLinePts[0], [Number(firstCoord[1].toFixed(5)), Number(firstCoord[0].toFixed(5))]);
+        assert.deepStrictEqual(routeLinePts[routeLinePts.length - 1], [Number(lastCoord[1].toFixed(5)), Number(lastCoord[0].toFixed(5))]);
 
         // Alternatives + return_steps (with maneuver location)
         const altRes = await client.callTool({
@@ -674,7 +1248,8 @@ test("MCP Server Test Suite", async (t) => {
         assert.strictEqual(altJson.alternatives_count, altJson.alternatives.length);
         if (altJson.alternatives.length > 0) {
             assert.strictEqual(altJson.alternatives[0].route_geometry?.type, "LineString");
-            assert.ok(altJson.alternatives[0].share_url.includes("#|PB:"));
+            const altPrefix = altJson.alternatives[0].route_geometry.coordinates.length > 15 ? "LBE:" : "LB:";
+            assert.ok(altJson.alternatives[0].share_url.includes(`#|${altPrefix}`));
         }
 
         // Waypoints (plus warning when combined with alternatives: true)
@@ -740,16 +1315,19 @@ test("MCP Server Test Suite", async (t) => {
         assert.strictEqual(countJson.counts.stop_signs, 1);
         assert.strictEqual(countJson.traffic_signals, undefined);
 
-        // 3. Route corridor mode accepts LineString geometry, computes along-route distances, and plots route + markers
+        // 3. Route corridor mode accepts LineString geometry, computes along-route distances, and plots open LB: route + markers
+        const corridorInputCoords = [
+            [-73.98555, 40.75795],
+            [-73.98505, 40.75845],
+            [-73.98465, 40.75885],
+            [-73.98435, 40.75915]
+        ];
         const routeCtrlRes = await client.callTool({
             name: "check_traffic_controls",
             arguments: {
                 route_geometry: {
                     type: "LineString",
-                    coordinates: [
-                        [-73.98555, 40.75795],
-                        [-73.98435, 40.75915]
-                    ]
+                    coordinates: corridorInputCoords
                 },
                 radius_meters: 25,
                 include_crossings: true
@@ -763,7 +1341,39 @@ test("MCP Server Test Suite", async (t) => {
         assert.ok(typeof routeCtrlJson.traffic_signals[0].distance_along_route_meters === "number");
         assert.ok(typeof routeCtrlJson.traffic_signals[0].distance_to_route_meters === "number");
         assert.ok(routeCtrlJson.traffic_signals[0].distance_along_route_meters <= routeCtrlJson.traffic_signals[1].distance_along_route_meters);
-        assert.ok(routeCtrlJson.share_url.includes("#|PB:"), `Expected route + markers in share_url, got ${routeCtrlJson.share_url}`);
+        assert.ok(routeCtrlJson.share_url.includes("#|LB:"), `Expected one-way LB: route + markers in share_url, got ${routeCtrlJson.share_url}`);
+        assert.ok(!routeCtrlJson.share_url.includes("PB:"), `Expected no mirrored PB: trace in share_url`);
+        // Round-trip check: parsed LB: points equal input coordinates in the exact same order with no duplicates
+        const parsedCorridorPts = parseShareUrlPolylinePoints(routeCtrlJson.share_url);
+        const expectedCorridorLatLng = corridorInputCoords.map(([lng, lat]) => [Number(lat.toFixed(5)), Number(lng.toFixed(5))]);
+        assert.deepStrictEqual(parsedCorridorPts, expectedCorridorLatLng);
+        assert.strictEqual(
+            new Set(parsedCorridorPts.map(([lat, lng]) => `${lat},${lng}`)).size,
+            parsedCorridorPts.length,
+            "Parsed route points must have no duplicate mirrored vertices"
+        );
+
+        // 3b. Longer >15-vertex route corridor must emit compact LBE: (including escaping `|` chunk deltas like -0.00031 deg)
+        const longCorridorCoords = Array.from({ length: 20 }, (_, i) => [
+            Number((-73.98555 + i * 0.00006).toFixed(5)),
+            Number((40.75950 - i * (i === 5 ? 0.00031 : 0.00008)).toFixed(5))
+        ]);
+        // Force an exact -0.00031 lat delta between index 4 and index 5 (produces raw `|` in 1e5 Google Polyline)
+        longCorridorCoords[5] = [longCorridorCoords[4][0], Number((longCorridorCoords[4][1] - 0.00031).toFixed(5))];
+        const longCtrlRes = await client.callTool({
+            name: "check_traffic_controls",
+            arguments: {
+                route_geometry: { type: "LineString", coordinates: longCorridorCoords },
+                radius_meters: 25
+            }
+        });
+        assert.strictEqual(longCtrlRes.isError, undefined);
+        const longCtrlJson = longCtrlRes.structuredContent;
+        assert.ok(longCtrlJson.share_url.includes("#|LBE:"), `Expected compact #|LBE: for 20-vertex corridor, got ${longCtrlJson.share_url}`);
+        assert.ok(!longCtrlJson.share_url.toUpperCase().includes("%7C"), "LBE: must never emit %7C hash delimiters");
+        const parsedLongPts = parseShareUrlPolylinePoints(longCtrlJson.share_url);
+        const expectedLongLatLng = longCorridorCoords.map(([lng, lat]) => [lat, lng]);
+        assert.deepStrictEqual(parsedLongPts, expectedLongLatLng);
 
         // 4. Direct origin + destination routing mode on check_traffic_controls
         const missingDestRes = await client.callTool({
@@ -787,7 +1397,8 @@ test("MCP Server Test Suite", async (t) => {
         assert.strictEqual(directRouteJson.route_summary?.profile, "driving");
         assert.ok(directRouteJson.route_summary?.distance_meters > 0);
         assert.ok(directRouteJson.counts.total > 0);
-        assert.ok(directRouteJson.share_url.includes("#|PB:"), `Expected route + markers in share_url, got ${directRouteJson.share_url}`);
+        assert.ok(/#\|(LB|LBE):/.test(directRouteJson.share_url), `Expected one-way LB:/LBE: route + markers in share_url, got ${directRouteJson.share_url}`);
+        assert.ok(parseShareUrlPolylinePoints(directRouteJson.share_url)?.length >= 2);
 
         // 5. Built-in list_osm_tags recognizes traffic light queries
         const tagRes = await client.callTool({
@@ -845,6 +1456,184 @@ test("MCP Server Test Suite", async (t) => {
             assert.ok(runtimeErrCount.content[0].text.includes("Overpass runtime error"), `Expected runtime error message, got: ${runtimeErrCount.content[0].text}`);
         } finally {
             await mockTransport.close();
+        }
+    });
+
+    await t.test("search_places queries mock Overture GeoParquet with filtering, pagination, caching, and mirror fallback", async () => {
+        // 1. Validation: missing location & bbox
+        const missingLocRes = await client.callTool({
+            name: "search_places",
+            arguments: { query: "coffee" }
+        });
+        assert.strictEqual(missingLocRes.isError, true);
+
+        // 2. Validation: out-of-range min_confidence
+        const badConfRes = await client.callTool({
+            name: "search_places",
+            arguments: { bbox: "40.753,-73.988,40.758,-73.983", min_confidence: 1.5 }
+        });
+        assert.strictEqual(badConfRes.isError, true);
+
+        // 3. Category matching excludes 'barber_shop' when querying 'bar', and default excludes permanently_closed & outside bbox
+        const barRes = await client.callTool({
+            name: "search_places",
+            arguments: { bbox: "40.753,-73.988,40.758,-73.983", category: "bar" }
+        });
+        assert.strictEqual(barRes.isError, undefined, barRes.content?.[0]?.text);
+        const barData = barRes.structuredContent;
+        assert.strictEqual(barData.release, "2026-10-21.0");
+        assert.strictEqual(barData.count, 1);
+        assert.strictEqual(barData.places[0].id, "place-jazz-bar");
+        assert.ok(barData.share_url.startsWith("https://vibhorsingh.com/boundingbox/"), `Unexpected share_url: ${barData.share_url}`);
+        const metadata = JSON.parse(Buffer.from(barData.share_url.split("|MCP:")[1], "base64url"));
+        assert.equal(metadata.returned, barData.returned_count);
+        assert.match(metadata.source, /Overture Maps Places/);
+        assert.strictEqual(overtureStats.londonAwsHits, 0, "NYC bbox should prune London STAC partition completely");
+
+        // 4. Category 'coffee shop' + min_confidence + default closed exclusion + brand/websites/phones/sources
+        const coffeeRes = await client.callTool({
+            name: "search_places",
+            arguments: {
+                bbox: "40.753,-73.988,40.758,-73.983",
+                category: "coffee shop",
+                min_confidence: 0.7,
+                sort_by: "confidence"
+            }
+        });
+        const coffeeData = coffeeRes.structuredContent;
+        assert.strictEqual(coffeeData.count, 2, "Should include Blue Bottle & Starbucks; exclude closed, low-conf, and uptown");
+        assert.strictEqual(coffeeData.places[0].id, "place-blue-bottle");
+        assert.strictEqual(coffeeData.places[0].brand?.name, "Blue Bottle");
+        assert.strictEqual(coffeeData.places[0].brand?.wikidata, "Q4928901");
+        assert.deepStrictEqual(coffeeData.places[0].websites, ["https://bluebottlecoffee.com"]);
+        assert.deepStrictEqual(coffeeData.places[0].phones, ["+15106533394"]);
+        assert.deepStrictEqual(coffeeData.places[0].emails, ["hello@bluebottlecoffee.com"]);
+        assert.deepStrictEqual(coffeeData.places[0].socials, ["https://instagram.com/bluebottle"]);
+        assert.deepStrictEqual(coffeeData.places[0].sources, ["meta", "Foursquare"]);
+        assert.strictEqual(coffeeData.complete, true);
+
+        // 5. include_closed: true includes permanently_closed place
+        const withClosedRes = await client.callTool({
+            name: "search_places",
+            arguments: {
+                bbox: "40.753,-73.988,40.758,-73.983",
+                category: "coffee_shop",
+                include_closed: true,
+                min_confidence: 0.7
+            }
+        });
+        assert.strictEqual(withClosedRes.structuredContent.count, 3);
+        assert.ok(withClosedRes.structuredContent.places.some(p => p.operating_status === "permanently_closed"));
+
+        // 6. Query text filter + count_only breakdown
+        const starbucksRes = await client.callTool({
+            name: "search_places",
+            arguments: {
+                bbox: "40.753,-73.988,40.758,-73.983",
+                query: "starbucks 1585"
+            }
+        });
+        assert.strictEqual(starbucksRes.structuredContent.count, 1);
+        assert.strictEqual(starbucksRes.structuredContent.places[0].id, "place-starbucks");
+
+        const countOnlyRes = await client.callTool({
+            name: "search_places",
+            arguments: {
+                bbox: "40.753,-73.988,40.758,-73.983",
+                count_only: true
+            }
+        });
+        const countData = countOnlyRes.structuredContent;
+        assert.strictEqual(countData.count, 5);
+        assert.strictEqual(countData.returned_count, 0);
+        assert.deepStrictEqual(countData.places, []);
+        assert.ok(countData.category_counts.some(c => c.category === "coffee_shop" && c.count === 3));
+
+        // 7. Single point defaults to 500m circle mode + pagination + query cache hit
+        const page1Res = await client.callTool({
+            name: "search_places",
+            arguments: {
+                bbox: "40.7558,-73.9854",
+                limit: 2,
+                offset: 0
+            }
+        });
+        const p1 = page1Res.structuredContent;
+        assert.ok(p1.count >= 4);
+        assert.strictEqual(p1.returned_count, 2);
+        assert.strictEqual(p1.has_more, true);
+        assert.strictEqual(p1.next_offset, 2);
+        assert.strictEqual(p1.truncated, true);
+        assert.ok(p1.warnings.some(w => w.includes("500m")));
+
+        const page2Res = await client.callTool({
+            name: "search_places",
+            arguments: {
+                bbox: "40.7558,-73.9854",
+                limit: 2,
+                offset: 2
+            }
+        });
+        const p2 = page2Res.structuredContent;
+        assert.strictEqual(p2.provenance.cached, true);
+        assert.notStrictEqual(p2.places[0].id, p1.places[0].id);
+
+        // 8. Mirror fallback: London AWS mirror returns 503 -> falls back to Azure 206
+        const londonRes = await client.callTool({
+            name: "search_places",
+            arguments: { bbox: "51.50,-0.14,51.52,-0.11", category: "coffee_shop" }
+        });
+        assert.strictEqual(londonRes.isError, undefined, londonRes.content?.[0]?.text);
+        const londonData = londonRes.structuredContent;
+        assert.strictEqual(londonData.count, 1);
+        assert.strictEqual(londonData.places[0].name, "Monmouth Coffee Company");
+        assert.ok(overtureStats.londonAwsHits >= 1, "Expected AWS primary request attempt");
+        assert.ok(overtureStats.londonAzureHits >= 1, "Expected Azure fallback read");
+        assert.ok(londonData.warnings.some(w => w.toLowerCase().includes("azure")), "Expected mirror fallback warning");
+    });
+
+    await t.test("search_places supports collection.json fallback, use_area_boundary polygon clip, and OVERTURE_MAX_ROW_GROUPS guard", async () => {
+        const fbTransport = new StdioClientTransport({
+            command: "node",
+            args: ["./dist/index.js"],
+            env: {
+                ...process.env,
+                NOMINATIM_API_URL: mockBaseUrl,
+                OVERTURE_STAC_URL: `${mockBaseUrl}/overture-fallback/catalog.json`,
+                OVERTURE_MAX_ROW_GROUPS: "3"
+            }
+        });
+        const fbClient = new Client({ name: "test-overture-fb", version: "1.0.0" }, { capabilities: {} });
+        await fbClient.connect(fbTransport);
+
+        try {
+            // 1. collection.json fallback (since collections.parquet returns 404) + location + use_area_boundary polygon filter
+            // Notice polygon covers lat 40.7550..40.7570, lon -73.9866..-73.9846 -> excludes Midnight Jazz Bar (40.7545, -73.9845)
+            const boundaryRes = await fbClient.callTool({
+                name: "search_places",
+                arguments: {
+                    location: "Times Square",
+                    use_area_boundary: true,
+                    min_confidence: 0.7
+                }
+            });
+            assert.strictEqual(boundaryRes.isError, undefined, boundaryRes.content?.[0]?.text);
+            const bData = boundaryRes.structuredContent;
+            assert.strictEqual(bData.matched_place, "Times Square Polygon Area");
+            assert.ok(!bData.places.some(p => p.id === "place-jazz-bar"), "Midnight Jazz Bar outside polygon boundary should be filtered out");
+            assert.ok(bData.places.some(p => p.id === "place-blue-bottle"));
+
+            // 2. OVERTURE_MAX_ROW_GROUPS guard (part-many-rg.parquet has 5 row groups > cap 3)
+            const capRes = await fbClient.callTool({
+                name: "search_places",
+                arguments: {
+                    bbox: "37.77,-122.42,37.785,-122.41"
+                }
+            });
+            assert.strictEqual(capRes.isError, true);
+            assert.ok(capRes.content[0].text.includes("OVERTURE_MAX_ROW_GROUPS"));
+        } finally {
+            await fbTransport.close();
         }
     });
 });

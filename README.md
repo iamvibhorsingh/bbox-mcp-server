@@ -2,13 +2,14 @@
 
 **FREE Geospatial tools for AI agents, with results you can inspect on a map.**
 
-Search OpenStreetMap, convert coordinates, generate H3 grids, calculate routes, and sample terrain elevation. **11 MCP tools, no API keys required to get started.** Spatial results include shareable links to the [interactive map](https://vibhorsingh.com/boundingbox/).
+Search OpenStreetMap & Overture Maps Places, convert coordinates, generate H3 grids, calculate routes, and sample terrain elevation. **12 MCP tools, no API keys required to get started.** Spatial results include shareable links to the [interactive map](https://vibhorsingh.com/boundingbox/).
 
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-green)](https://nodejs.org/) [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
 ## Try asking
 
 - “Find cafes near Times Square.”
+- “Find commercial coffee shops near Times Square with confidence scores, websites, and phone numbers.”
 - “Find me pizza near the Colosseum?”
 - “Eiffel Tower to the Louvre: walk or bike? Compare the routes.”
 - “Where are Manhattan’s coffee hotspots?”
@@ -47,11 +48,12 @@ Requires **Node.js 18+**. Add this to your MCP client configuration:
 | `generate_share_url` | Create a shareable map link for a bounding box. |
 | `reverse_geocode` | Resolve coordinates to an address and OpenStreetMap details. |
 | `search_overpass` | Find or count OSM features within an area, bounding box, or radius. |
+| `search_places` | Query Overture Maps Places POIs directly with confidence scores, brands, phones, websites, and addresses. |
 | `list_osm_tags` | Find OSM tags by category using curated suggestions and Taginfo fallback. |
 | `aggregate_overpass_h3` | Group OSM query results into H3 hexagons for density analysis. |
 | `calculate_route` | Get driving, walking, or cycling routes with optional waypoints, alternatives, and geometry. |
-| `get_elevation` | Get elevation for points or sample a terrain grid using the 90m Copernicus DEM. |
-| `spatial_calc` | Calculate geometry relations, point containment, distance/bearing, and grid subdivisions offline. |
+| `get_elevation` | Get elevation for points, sample terrain grids, analyze 3D line-of-sight with Earth curvature, or compute route elevation/grade profiles using the 90m Copernicus DEM. |
+| `spatial_calc` | Calculate geometry relations, point containment, WGS84 ellipsoidal distance/bearing, grid subdivisions, and 3D camera frustum footprints offline. |
 | `check_traffic_controls` | Check traffic signals and stop signs at a junction, in a bbox/radius, or along a route. |
 
 Your MCP client discovers each tool's full parameter and output schemas automatically. H3 tools use `resolution` (0–15).
@@ -65,6 +67,8 @@ Tools with a `location` parameter accept place names. Tools with a `bbox` parame
 `get_bounds` supports 3,900+ bundled projections via `epsg` and nine output formats: `csv`, `wkt`, `geojson-bbox`, `geojson-polygon`, `leaflet`, `overpass`, `ogc-bbox`, `kml`, and `stac-bbox`.
 
 For Overpass searches, supply a selector such as `nwr["amenity"="cafe"]`; the server adds spatial filters. Set `radius_meters` for an explicit distance or omit it to search the area. Use `list_osm_tags` to find selectors by category.
+
+For commercial POIs with confidence scores, brands, phone numbers, and websites, `search_places` queries Overture Maps GeoParquet files directly via HTTP range requests (no Python runtime required).
 
 ## Configuration
 
@@ -86,6 +90,9 @@ Add an `env` object alongside `command` and `args` in your server configuration.
 | `OSRM_API_URL` | Preferred routing endpoint; defaults use public OSRM services. |
 | `ELEVATION_API_URL` | Elevation endpoint; defaults to `https://api.open-meteo.com/v1/elevation`. |
 | `MAX_H3_CELLS` | H3 generation cap; defaults to `50000`. |
+| `OVERTURE_STAC_URL` | Custom Overture Maps STAC root catalog URL; defaults to `https://stac.overturemaps.org/catalog.json`. |
+| `OVERTURE_STORAGE_PROVIDER` | Preferred cloud mirror for Overture GeoParquet files (`aws` default, or `azure`). |
+| `OVERTURE_MAX_ROW_GROUPS` | Row-group scan safety cap per `search_places` query; defaults to `40`. |
 
 </details>
 
@@ -105,7 +112,7 @@ npm start
 
 ## Data and service use
 
-Data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright). Public services have usage limits: avoid bulk scraping and frequent polling, and configure your own endpoints for shared or heavy workloads.
+Data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright) and [Overture Maps Foundation](https://overturemaps.org/) (`CDLA-Permissive-2.0`). Public services have usage limits: avoid bulk scraping and frequent polling, and configure your own endpoints for shared or heavy workloads.
 
 - [Nominatim](https://operations.osmfoundation.org/policies/nominatim/) and [FOSSGIS routing](https://routing.openstreetmap.de/about.html) limit requests to 1 per second. Nominatim also requires application identification, caching, and attribution. The server's per-process queue does not cover traffic across multiple instances.
 - [Photon's public endpoint](https://github.com/komoot/photon#demo-server) is a demo service without availability guarantees.

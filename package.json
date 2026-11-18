@@ -1,8 +1,8 @@
 {
     "name": "bbox-mcp-server",
     "mcpName": "io.github.iamvibhorsingh/bbox-mcp-server",
-    "version": "1.6.0",
-    "description": "The geospatial toolkit for AI agents — query, route, elevate, convert, and verify spatial data with zero config. 11 tools for bounding boxes, coordinate projection, H3 indexing, OpenStreetMap Overpass queries, traffic control checks, OSRM routing, Copernicus DEM elevation, spatial geometry math, and shareable map verification links.",
+    "version": "1.7.0",
+    "description": "The geospatial toolkit for AI agents — query, route, elevate, convert, and verify spatial data with zero config. 12 tools for bounding boxes, coordinate projection, H3 indexing, Overture Maps Places search, OpenStreetMap Overpass queries, traffic control checks, OSRM routing, Copernicus DEM elevation, spatial geometry math, and shareable map verification links.",
     "type": "module",
     "license": "MIT",
     "author": "Vibhor Singh",
@@ -35,6 +35,8 @@
         "overpass",
         "osm",
         "openstreetmap",
+        "overture",
+        "places",
         "poi"
     ],
     "bin": {
@@ -56,12 +58,15 @@
         "@modelcontextprotocol/sdk": "^1.27.1",
         "@terraformer/wkt": "^2.2.1",
         "h3-js": "^4.1.0",
+        "hyparquet": "^1.33.0",
+        "hyparquet-compressors": "^1.1.3",
         "proj4": "^2.15.0"
     },
     "devDependencies": {
         "@types/node": "^22.13.5",
         "@types/proj4": "^2.5.5",
         "@types/terraformer__wkt": "^2.0.3",
+        "hyparquet-writer": "^0.18.0",
         "typescript": "^5.7.3"
     },
     "engines": {
