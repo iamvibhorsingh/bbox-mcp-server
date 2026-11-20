@@ -456,6 +456,26 @@ test("MCP Server Test Suite", async (t) => {
                     }));
                 }
             });
+        } else if (req.url?.startsWith("/overpass-poisoned")) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+                version: 0.6,
+                generator: "Overpass API 0.7.62",
+                osm3s: { timestamp_osm_base: "2026-11-03T00:00:00Z" },
+                elements: [
+                    {
+                        type: "node",
+                        id: 9001,
+                        lat: 40.758,
+                        lon: -73.985,
+                        tags: {
+                            amenity: "cafe",
+                            name: "Cafe\u202E\u{E0041}\u200B\nLine2",
+                            note: "A".repeat(700)
+                        }
+                    }
+                ]
+            }));
         } else if (reqPath === "/elevation") {
             const reqUrl = new URL(req.url, mockBaseUrl);
             const lats = (reqUrl.searchParams.get("latitude") || "").split(",").filter(Boolean).map(Number);
@@ -1634,6 +1654,83 @@ test("MCP Server Test Suite", async (t) => {
             assert.ok(capRes.content[0].text.includes("OVERTURE_MAX_ROW_GROUPS"));
         } finally {
             await fbTransport.close();
+        }
+    });
+
+    await t.test("security hardening - ReDoS resistance, empty EPSG guard, Overpass QL validation, and external text sanitization", async () => {
+        // 1. parseBBox resists ReDoS input (40 repeated spaced tokens + invalid tail)
+        const t0 = performance.now();
+        const redosRes = await client.callTool({
+            name: "get_bounds",
+            arguments: { bbox: "1  ".repeat(40) + "1x" }
+        });
+        const elapsedMs = performance.now() - t0;
+        assert.strictEqual(redosRes.isError, true);
+        assert.ok(elapsedMs < 1000, `Expected linear-time rejection for ReDoS input, took ${elapsedMs.toFixed(1)}ms`);
+
+        // 2. Non-numeric EPSG code rejected immediately without hitting epsg.io
+        const badEpsgRes = await client.callTool({
+            name: "get_bounds",
+            arguments: { bbox: "0,0,1,1", epsg: "abc" }
+        });
+        assert.strictEqual(badEpsgRes.isError, true);
+        assert.ok(badEpsgRes.content[0].text.includes("Unknown EPSG code"));
+
+        // 3. Overpass QL bypass attempts rejected (case-insensitive directive, outer parens, union breakout, bad timeout)
+        const bypassQueries = [
+            '[ OUT:xml ]; nwr["amenity"="cafe"]',
+            '(nwr["amenity"="cafe"])',
+            'nwr["amenity"="cafe"]); out meta; (nwr["shop"]',
+            'nwr["amenity"="cafe"]; out meta',
+            'make stat total=1'
+        ];
+        for (const q of bypassQueries) {
+            const res = await client.callTool({
+                name: "search_overpass",
+                arguments: { bbox: "40.63,-73.79,40.65,-73.76", query: q }
+            });
+            assert.strictEqual(res.isError, true, `Expected unsafe Overpass query to be rejected: ${q}`);
+        }
+
+        const badTimeoutRes = await client.callTool({
+            name: "search_overpass",
+            arguments: { bbox: "40.63,-73.79,40.65,-73.76", query: 'nwr["amenity"="parking"]', timeout_seconds: "25][maxsize:999" }
+        });
+        assert.strictEqual(badTimeoutRes.isError, true);
+
+        // 4. Legitimate multi-statement + regex + quoted-semicolon Overpass queries still work
+        const validComplexRes = await client.callTool({
+            name: "search_overpass",
+            arguments: {
+                bbox: "40.63,-73.79,40.65,-73.76",
+                query: 'nwr["amenity"="parking"]["name"~"Terminal|Garage",i]; node["amenity"="parking"]["opening_hours"="Mo-Fr; Sa"]'
+            }
+        });
+        assert.strictEqual(validComplexRes.isError, undefined, validComplexRes.content?.[0]?.text);
+
+        // 5. Untrusted external OSM tags strip invisible/bidi/tag-block chars, collapse newlines, and cap length
+        const poisonTransport = new StdioClientTransport({
+            command: "node",
+            args: ["./dist/index.js"],
+            env: {
+                ...process.env,
+                OVERPASS_API_URL: `${mockBaseUrl}/overpass-poisoned`,
+                OVERPASS_DISABLE_PUBLIC_FALLBACK: "1"
+            }
+        });
+        const poisonClient = new Client({ name: "test-poison", version: "1.0.0" }, { capabilities: {} });
+        await poisonClient.connect(poisonTransport);
+        try {
+            const pRes = await poisonClient.callTool({
+                name: "search_overpass",
+                arguments: { bbox: "40.75,-73.99,40.76,-73.98", query: 'nwr["amenity"="cafe"]' }
+            });
+            assert.strictEqual(pRes.isError, undefined, pRes.content?.[0]?.text);
+            const el = pRes.structuredContent.elements[0];
+            assert.strictEqual(el.name, "Cafe Line2");
+            assert.ok(el.tags.note.length <= 500, `Expected tag value capped at 500 chars, got ${el.tags.note.length}`);
+        } finally {
+            await poisonTransport.close();
         }
     });
 });

@@ -151,6 +151,74 @@ function safeMax(arr: number[]): number {
     return max;
 }
 
+function setBoundedCache<K, V>(cache: Map<K, V>, maxEntries: number, key: K, value: V): void {
+    if (cache.has(key)) {
+        cache.delete(key);
+    } else if (cache.size >= maxEntries) {
+        const oldestKey = cache.keys().next().value;
+        if (oldestKey !== undefined) cache.delete(oldestKey);
+    }
+    cache.set(key, value);
+}
+
+// Strip ASCII control chars, bidi overrides, zero-width chars, and Unicode Tag block (U+E0000-U+E007F)
+const UNSAFE_TEXT_CHARS_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}]/gu;
+
+function sanitizeExternalText(input: unknown, maxLength = 300): string {
+    if (typeof input !== 'string') return '';
+    const cleaned = input
+        .replace(UNSAFE_TEXT_CHARS_RE, '')
+        .replace(/[\r\n\t]+/g, ' ')
+        .trim();
+    if (cleaned.length <= maxLength) return cleaned;
+    return cleaned.slice(0, maxLength - 1) + '…';
+}
+
+function sanitizeExternalTags(tags: unknown, maxKeys = 50, maxValueLength = 500): Record<string, string> {
+    if (!tags || typeof tags !== 'object' || Array.isArray(tags)) return {};
+    const out: Record<string, string> = {};
+    let count = 0;
+    for (const [rawKey, rawVal] of Object.entries(tags as Record<string, unknown>)) {
+        if (count >= maxKeys) break;
+        const key = sanitizeExternalText(rawKey, 100);
+        if (!key) continue;
+        const val = typeof rawVal === 'string'
+            ? sanitizeExternalText(rawVal, maxValueLength)
+            : sanitizeExternalText(String(rawVal ?? ''), maxValueLength);
+        out[key] = val;
+        count++;
+    }
+    return out;
+}
+
+function escapeMarkdownInline(text: string): string {
+    return text.replace(/([[\]()\\`])/g, '\\$1');
+}
+
+function normalizeHttpUrlArray(val: unknown, maxItems = 20): string[] {
+    if (!Array.isArray(val)) return [];
+    const seen = new Set<string>();
+    for (const item of val) {
+        if (seen.size >= maxItems) break;
+        if (typeof item !== 'string') continue;
+        const cleaned = sanitizeExternalText(item, 500);
+        if (!cleaned) continue;
+        // Reject dangerous URI schemes (javascript:, data:, vbscript:, file:, etc.)
+        const schemeMatch = cleaned.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
+        if (schemeMatch && !/^https?$/i.test(schemeMatch[1])) continue;
+        seen.add(cleaned);
+    }
+    return [...seen];
+}
+
+function assertSafeHttpUrl(rawUrl: string, baseUrl?: string): string {
+    const parsed = baseUrl ? new URL(rawUrl, baseUrl) : new URL(rawUrl);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw new Error(`Unsupported URL protocol '${parsed.protocol}' in external catalog link.`);
+    }
+    return parsed.href;
+}
+
 // ---------------------------------------------------------------------------
 // Pure Functions Ported from bbox.js
 // ---------------------------------------------------------------------------
@@ -279,7 +347,7 @@ function parseBBox(input: string, warnings?: string[]): BBox {
     // --- 4. Strict Coordinate Array Sniffer ---
     const trimmed = input.trim();
     // Reject strings containing unexpected characters outside brackets, parens, commas, whitespace, digits, signs, decimal point, exponent
-    if (!/^[\[\(\s]*[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?(?:\s*[\s,]\s*[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)*[\]\)\s]*$/i.test(trimmed)) {
+    if (!/^[\[\(\s]*[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?(?:(?:\s*,\s*|\s+)[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)*[\]\)\s]*$/i.test(trimmed)) {
         throw new Error(`Failed to parse bounding box: contains invalid coordinate tokens. Input must be valid WKT, GeoJSON, ogrinfo extent, tile "z/x/y", point "lat,lng", or "lat1,lng1,lat2,lng2". Got: ${input.substring(0, 50)}`);
     }
 
@@ -396,7 +464,13 @@ function projectBounds(bbox: BBox, epsg: string): { xmin: number, ymin: number, 
  * if it's not in the bundled proj4defs.json. Caches the result for future
  * calls within the same server session.
  */
+const DYNAMIC_EPSG_CODES = new Set<string>();
+const MAX_DYNAMIC_EPSG_CODES = 500;
+
 async function ensureProjection(epsg: string): Promise<void> {
+    if (!/^\d+$/.test(epsg)) {
+        throw new Error(`Unknown EPSG code: ${epsg || '(empty)'}. EPSG code must be numeric.`);
+    }
     const epsgKey = `EPSG:${epsg}`;
     if (proj4.defs(epsgKey)) {
         return; // Already loaded
@@ -419,13 +493,20 @@ async function ensureProjection(epsg: string): Promise<void> {
             throw new Error(`epsg.io returned status ${response.status}`);
         }
 
-        const proj4String = await response.text();
+        const proj4String = (await response.text()).trim();
 
-        if (!proj4String || proj4String.includes('<!DOCTYPE html>') || proj4String.trim().length === 0) {
+        if (!proj4String || proj4String.length > 2048 || proj4String.includes('<!DOCTYPE html>') || !proj4String.includes('+proj=')) {
             throw new Error(`Invalid proj4 string received for EPSG:${epsg}`);
         }
 
-        proj4.defs(epsgKey, proj4String.trim());
+        if (DYNAMIC_EPSG_CODES.size >= MAX_DYNAMIC_EPSG_CODES) {
+            const oldest = DYNAMIC_EPSG_CODES.values().next().value;
+            if (oldest) {
+                DYNAMIC_EPSG_CODES.delete(oldest);
+            }
+        }
+        proj4.defs(epsgKey, proj4String);
+        DYNAMIC_EPSG_CODES.add(epsgKey);
         log('info', `Successfully loaded EPSG:${epsg} from epsg.io`);
     } catch (err: any) {
         if (err.name === 'AbortError') {
@@ -1405,6 +1486,7 @@ const photonRateLimit = createRateLimiter(1000);
 const routingRateLimit = createRateLimiter(1000);
 
 const NOMINATIM_CACHE = new Map<string, { timestamp: number; data: any }>();
+const NOMINATIM_CACHE_MAX = 500;
 const NOMINATIM_TTL_MS = 60 * 60 * 1000; // 1 hour TTL
 const NOMINATIM_BASE_URL = (process.env.NOMINATIM_API_URL || "https://nominatim.openstreetmap.org").replace(/\/+$/, "");
 const PHOTON_BASE_URL = (process.env.PHOTON_API_URL || "https://photon.komoot.io").replace(/\/+$/, "");
@@ -1451,7 +1533,7 @@ async function fetchNominatim(url: string): Promise<{ data: any; cached: boolean
 
         const data = await response.json();
         const now = Date.now();
-        NOMINATIM_CACHE.set(url, { timestamp: now, data });
+        setBoundedCache(NOMINATIM_CACHE, NOMINATIM_CACHE_MAX, url, { timestamp: now, data });
         return {
             data,
             cached: false,
@@ -1460,7 +1542,7 @@ async function fetchNominatim(url: string): Promise<{ data: any; cached: boolean
         };
     } catch (err: any) {
         if (err.name === 'AbortError') {
-            throw new Error(`Nominatim request timed out after ${FETCH_TIMEOUT_MS / 1000}s for URL: ${url}`);
+            throw new Error(`Nominatim request timed out after ${FETCH_TIMEOUT_MS / 1000}s from ${NOMINATIM_BASE_URL}`);
         }
         throw err;
     } finally {
@@ -1523,13 +1605,13 @@ async function geocodeLocation(query: string, includePolygon: boolean = false, w
                 const polygons_with_holes = item.geojson ? (extractPolygonsWithHolesLatLng(item.geojson) || undefined) : undefined;
 
                 return {
-                    matched_place: item.display_name,
+                    matched_place: sanitizeExternalText(item.display_name, 300),
                     bbox,
                     center,
                     osm_area_id,
-                    class: item.class,
-                    type: item.type,
-                    osm_type: item.osm_type,
+                    class: item.class ? sanitizeExternalText(String(item.class), 80) : undefined,
+                    type: item.type ? sanitizeExternalText(String(item.type), 80) : undefined,
+                    osm_type: item.osm_type ? sanitizeExternalText(String(item.osm_type), 40) : undefined,
                     osm_id: osmIdNum,
                     ...(polygons_with_holes ? { polygons_with_holes } : {})
                 };
@@ -1590,7 +1672,7 @@ async function geocodeLocation(query: string, includePolygon: boolean = false, w
                 if (response.ok) {
                     data = await response.json();
                     const now = Date.now();
-                    PHOTON_CACHE.set(photonUrl, { timestamp: now, data });
+                    setBoundedCache(PHOTON_CACHE, NOMINATIM_CACHE_MAX, photonUrl, { timestamp: now, data });
                     timestamp = new Date(now).toISOString();
                 }
             } finally {
@@ -1619,14 +1701,16 @@ async function geocodeLocation(query: string, includePolygon: boolean = false, w
                 if (osm_type === "relation" && !isNaN(osm_id)) osm_area_id = 3600000000 + osm_id;
                 else if (osm_type === "way" && !isNaN(osm_id)) osm_area_id = 2400000000 + osm_id;
 
-                const labelParts = [props.name, props.city, props.state, props.country].filter(Boolean);
+                const labelParts = [props.name, props.city, props.state, props.country]
+                    .map(v => sanitizeExternalText(v, 120))
+                    .filter(Boolean);
                 return {
-                    matched_place: labelParts.length > 0 ? labelParts.join(", ") : query,
+                    matched_place: labelParts.length > 0 ? labelParts.join(", ") : sanitizeExternalText(query, 200),
                     bbox,
                     center,
                     osm_area_id,
-                    class: props.osm_key,
-                    type: props.osm_value,
+                    class: props.osm_key ? sanitizeExternalText(String(props.osm_key), 80) : undefined,
+                    type: props.osm_value ? sanitizeExternalText(String(props.osm_value), 80) : undefined,
                     osm_type,
                     osm_id: !isNaN(osm_id) ? osm_id : undefined
                 };
@@ -1679,10 +1763,10 @@ async function geocodeLocation(query: string, includePolygon: boolean = false, w
                     throw new Error(`Unable to determine location bounds for feature`);
                 }
                 return {
-                    matched_place: feature.place_name || feature.text || query,
+                    matched_place: sanitizeExternalText(feature.place_name || feature.text || query, 300),
                     bbox,
                     center,
-                    class: feature.properties?.category
+                    class: feature.properties?.category ? sanitizeExternalText(String(feature.properties.category), 80) : undefined
                 };
             });
 
@@ -1752,16 +1836,17 @@ async function reverseGeocode(lat: number, lng: number, zoom: number = 18): Prom
         bbox = ensureValidBBox(lat - 0.005, lng - 0.005, lat + 0.005, lng + 0.005);
     }
 
-    const shareUrl = buildShareUrlMarkersOnly([{ coordinates: { lat, lon: lng }, name: data.display_name }]);
+    const matchedPlace = sanitizeExternalText(data.display_name, 300);
+    const shareUrl = buildShareUrlMarkersOnly([{ coordinates: { lat, lon: lng }, name: matchedPlace }]);
 
     return {
-        matched_place: data.display_name,
+        matched_place: matchedPlace,
         center: { lat, lng },
         bbox,
-        address: data.address || {},
-        ...(data.class ? { class: String(data.class) } : {}),
-        ...(data.type ? { type: String(data.type) } : {}),
-        ...(data.osm_type ? { osm_type: String(data.osm_type) } : {}),
+        address: sanitizeExternalTags(data.address || {}, 40, 200),
+        ...(data.class ? { class: sanitizeExternalText(String(data.class), 80) } : {}),
+        ...(data.type ? { type: sanitizeExternalText(String(data.type), 80) } : {}),
+        ...(data.osm_type ? { osm_type: sanitizeExternalText(String(data.osm_type), 40) } : {}),
         ...(data.osm_id ? { osm_id: parseInt(data.osm_id, 10) } : {}),
         share_url: shareUrl,
         provenance: {
@@ -1785,6 +1870,11 @@ function splitOverpassStatements(query: string): string[] {
 
     for (let i = 0; i < query.length; i++) {
         const char = query[i];
+        if ((inDouble || inSingle) && char === '\\' && i + 1 < query.length) {
+            current += char + query[i + 1];
+            i++;
+            continue;
+        }
         if (char === '"' && !inSingle) {
             inDouble = !inDouble;
             current += char;
@@ -1804,6 +1894,85 @@ function splitOverpassStatements(query: string): string[] {
         statements.push(current.trim());
     }
     return statements;
+}
+
+/**
+ * Validates user/agent-provided Overpass QL core selectors without blocking
+ * legitimate tag/regex/multi-statement queries. Rejects global directives,
+ * unbalanced quotes/parentheses (union breakouts), parenthesized filter-bypass
+ * blocks, and non-selector control statements (`out`, `make`, `area`, etc.).
+ */
+function validateOverpassQuery(queryRaw: string): string | null {
+    if (queryRaw.length > 2000) {
+        return "Error: Query is too long (maximum 2000 characters).";
+    }
+
+    let inDouble = false;
+    let inSingle = false;
+    let parenDepth = 0;
+    let skeleton = '';
+
+    for (let i = 0; i < queryRaw.length; i++) {
+        const ch = queryRaw[i];
+        if ((inDouble || inSingle) && ch === '\\' && i + 1 < queryRaw.length) {
+            i++;
+            continue;
+        }
+        if (ch === '"' && !inSingle) {
+            inDouble = !inDouble;
+            continue;
+        }
+        if (ch === "'" && !inDouble) {
+            inSingle = !inSingle;
+            continue;
+        }
+        if (!inDouble && !inSingle) {
+            if (ch === '(') parenDepth++;
+            else if (ch === ')') {
+                parenDepth--;
+                if (parenDepth < 0) {
+                    return "Error: Query contains unbalanced parentheses.";
+                }
+            }
+            skeleton += ch;
+        }
+    }
+
+    if (inDouble || inSingle) {
+        return "Error: Query contains an unterminated quoted string.";
+    }
+    if (parenDepth !== 0) {
+        return "Error: Query contains unbalanced parentheses.";
+    }
+
+    if (/\[\s*(?:out|timeout|bbox|maxsize|date|diff|adiff)\s*:/i.test(skeleton)) {
+        return "Error: Query must not contain [out:], [timeout:], [bbox:], or [maxsize:] directives. The server handles these automatically.";
+    }
+
+    const skeletonStatements = skeleton.split(';').map(s => s.trim()).filter(Boolean);
+    if (skeletonStatements.length === 0) {
+        return "Error: Query must contain at least one Overpass selector statement (e.g. `nwr[\"amenity\"=\"cafe\"]`).";
+    }
+
+    for (const stmt of skeletonStatements) {
+        if (stmt.startsWith('(')) {
+            return "Error: Do not wrap query statements in outer parentheses; the server applies union and spatial filters automatically.";
+        }
+        if (/^(?:out|make|area|is_in|retro|for|foreach|complete|convert|timeline|local)\b/i.test(stmt)) {
+            return "Error: Query must contain only Overpass element selectors (node/way/relation/nwr), not output or control statements.";
+        }
+    }
+
+    return null;
+}
+
+function parseClampedTimeoutSec(raw: unknown, defaultSec = 25): number {
+    if (raw === undefined || raw === null) return defaultSec;
+    const n = typeof raw === 'number' ? raw : Number(raw);
+    if (!Number.isFinite(n) || n <= 0) {
+        throw new Error(`Invalid 'timeout_seconds': must be a positive number.`);
+    }
+    return Math.max(1, Math.min(180, Math.round(n)));
 }
 
 /**
@@ -2080,11 +2249,14 @@ const OVERPASS_INFLIGHT = new Map<string, Promise<OverpassExecutionResult>>();
 let preferredOverpassEndpoint: string | null = null;
 
 const TAGINFO_CACHE = new Map<string, { timestamp: number; text: string; tags: string[] }>();
+const TAGINFO_CACHE_MAX = 200;
 const TAGINFO_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 const ROUTE_CACHE = new Map<string, { timestamp: number; data: any; provider: string }>();
+const ROUTE_CACHE_MAX = 200;
 const ROUTE_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 const ELEVATION_CACHE = new Map<string, { timestamp: number; elevations: number[] }>();
+const ELEVATION_CACHE_MAX = 500;
 const ELEVATION_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 async function fetchElevationsBatch(
@@ -2131,7 +2303,7 @@ async function fetchElevationsBatch(
             throw new Error(`Unexpected response from elevation API`);
         }
         const now = Date.now();
-        ELEVATION_CACHE.set(cacheKey, { timestamp: now, elevations: json.elevation });
+        setBoundedCache(ELEVATION_CACHE, ELEVATION_CACHE_MAX, cacheKey, { timestamp: now, elevations: json.elevation });
         return {
             elevations: json.elevation,
             cached: false,
@@ -2215,12 +2387,10 @@ async function executeOverpassQueryUncached(overpassQuery: string, timeoutSec: n
     // 1. overpass-api.de (FOSSGIS / main German instance)
     // 2. overpass.private.coffee (Private.coffee — successor to Kumi Systems)
     // 3. overpass.openstreetmap.fr (OSM France instance)
-    // 4. maps.mail.ru (VK Maps independent Overpass mirror)
     const defaultEndpoints = [
         "https://overpass-api.de/api/interpreter",
         "https://overpass.private.coffee/api/interpreter",
-        "https://overpass.openstreetmap.fr/api/interpreter",
-        "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
+        "https://overpass.openstreetmap.fr/api/interpreter"
     ];
     const customEndpoints = process.env.OVERPASS_API_URL
         ? process.env.OVERPASS_API_URL.split(",").map(s => s.trim()).filter(Boolean)
@@ -2352,7 +2522,7 @@ async function executeOverpassQueryUncached(overpassQuery: string, timeoutSec: n
             cached: false,
             cache_age_ms: 0
         },
-        remarkWarning: typeof data.remark === 'string' ? data.remark : undefined
+        remarkWarning: typeof data.remark === 'string' ? sanitizeExternalText(data.remark, 300) : undefined
     };
 }
 
@@ -2444,7 +2614,7 @@ async function getTaginfoSuggestions(keyword: string): Promise<{ text: string; t
         });
 
         const text = `Taginfo OSM Tag Recommendations for '${keyword}':\n\n${lines.join('\n')}`;
-        TAGINFO_CACHE.set(cacheKey, { timestamp: now, text, tags });
+        setBoundedCache(TAGINFO_CACHE, TAGINFO_CACHE_MAX, cacheKey, { timestamp: now, text, tags });
         return {
             text,
             tags,
@@ -2551,10 +2721,10 @@ function summarizeOsrmRoute(
 
     const steps = returnSteps && Array.isArray(routeObj.legs)
         ? routeObj.legs.flatMap((leg: any) => leg.steps || []).map((s: any) => ({
-            name: s.name || "unnamed road",
+            name: sanitizeExternalText(s.name, 200) || "unnamed road",
             distance_meters: Math.round(s.distance),
             duration_seconds: Math.round(s.duration),
-            ...(s.maneuver?.type ? { maneuver: `${s.maneuver.type}${s.maneuver.modifier ? ' ' + s.maneuver.modifier : ''}` } : {}),
+            ...(s.maneuver?.type ? { maneuver: sanitizeExternalText(`${s.maneuver.type}${s.maneuver.modifier ? ' ' + s.maneuver.modifier : ''}`, 80) } : {}),
             ...(Array.isArray(s.maneuver?.location) && s.maneuver.location.length >= 2
                 ? { location: { lat: s.maneuver.location[1], lng: s.maneuver.location[0] } }
                 : {})
@@ -2673,13 +2843,13 @@ async function fetchOsrmRoute(
                     usedProvider = candidate.provider;
                     const now = Date.now();
                     dataTimestamp = new Date(now).toISOString();
-                    ROUTE_CACHE.set(routeCacheKey, { timestamp: now, data: rawRoutes, provider: usedProvider });
+                    setBoundedCache(ROUTE_CACHE, ROUTE_CACHE_MAX, routeCacheKey, { timestamp: now, data: rawRoutes, provider: usedProvider });
                     break;
                 }
                 throw new Error(json.message || `Routing returned code ${json.code}`);
             } catch (err: any) {
                 lastRouteErr = err;
-                log('warn', `OSRM routing failed at ${candidate.url}`, { error: err.message });
+                log('warn', `OSRM routing failed at ${candidate.provider}`, { error: err.message });
             } finally {
                 clearTimeout(timeout);
             }
@@ -2831,16 +3001,6 @@ function getFreshCacheEntry<K, V extends { cachedAt: number }>(
     return entry;
 }
 
-function setBoundedCache<K, V>(cache: Map<K, V>, maxEntries: number, key: K, value: V): void {
-    if (cache.has(key)) {
-        cache.delete(key);
-    } else if (cache.size >= maxEntries) {
-        const oldestKey = cache.keys().next().value;
-        if (oldestKey !== undefined) cache.delete(oldestKey);
-    }
-    cache.set(key, value);
-}
-
 const fetchWithOvertureHeaders: typeof globalThis.fetch = async (input, init) => {
     const headers = new Headers(init?.headers);
     if (!headers.has("User-Agent")) {
@@ -2913,7 +3073,7 @@ async function getOvertureCatalog(stacUrl: string = OVERTURE_STAC_URL): Promise<
         let releaseCatalogUrl = stacUrl;
         if (childLinks.length > 0) {
             const candidates = childLinks.map((link) => {
-                const url = new URL(link.href, stacUrl).href;
+                const url = assertSafeHttpUrl(link.href, stacUrl);
                 return { release: extractOvertureReleaseName(url, latestTag), url };
             });
             const exactLatest = latestTag ? candidates.find((c) => c.release === latestTag) : undefined;
@@ -2957,7 +3117,8 @@ async function fetchOvertureFilesViaCollectionJson(releaseDirUrl: string): Promi
     const collection = (await colResp.json()) as { links?: Array<{ rel?: string; href?: string }> };
     const itemLinks = (collection.links || [])
         .filter((l): l is { rel: string; href: string } => l?.rel === "item" && typeof l?.href === "string")
-        .map((l) => new URL(l.href, collectionUrl).href);
+        .slice(0, 500)
+        .map((l) => assertSafeHttpUrl(l.href, collectionUrl));
 
     const files: OverturePlaceFile[] = [];
     for (let i = 0; i < itemLinks.length; i += 8) {
@@ -2974,8 +3135,8 @@ async function fetchOvertureFilesViaCollectionJson(releaseDirUrl: string): Promi
                     assets?: { aws?: { href?: string }; azure?: { href?: string } };
                 };
                 if (!Array.isArray(item.bbox) || item.bbox.length < 4) return null;
-                const awsHref = item.assets?.aws?.href ? new URL(item.assets.aws.href, itemUrl).href : undefined;
-                const azureHref = item.assets?.azure?.href ? new URL(item.assets.azure.href, itemUrl).href : undefined;
+                const awsHref = item.assets?.aws?.href ? assertSafeHttpUrl(item.assets.aws.href, itemUrl) : undefined;
+                const azureHref = item.assets?.azure?.href ? assertSafeHttpUrl(item.assets.azure.href, itemUrl) : undefined;
                 if (!awsHref && !azureHref) return null;
                 return {
                     id: String(item.id || itemUrl),
@@ -3046,8 +3207,8 @@ async function getOverturePlaceFiles(
                 if (!b || typeof b.xmin !== "number" || typeof b.ymin !== "number" || typeof b.xmax !== "number" || typeof b.ymax !== "number") {
                     continue;
                 }
-                const awsHref = row.assets?.aws?.href ? new URL(String(row.assets.aws.href), collectionsParquetUrl).href : undefined;
-                const azureHref = row.assets?.azure?.href ? new URL(String(row.assets.azure.href), collectionsParquetUrl).href : undefined;
+                const awsHref = row.assets?.aws?.href ? assertSafeHttpUrl(String(row.assets.aws.href), collectionsParquetUrl) : undefined;
+                const azureHref = row.assets?.azure?.href ? assertSafeHttpUrl(String(row.assets.azure.href), collectionsParquetUrl) : undefined;
                 if (!awsHref && !azureHref) continue;
                 files.push({
                     id: String(row.id || awsHref || azureHref),
@@ -3269,8 +3430,11 @@ function normalizeStringArray(val: unknown): string[] {
     if (!Array.isArray(val)) return [];
     const seen = new Set<string>();
     for (const item of val) {
-        if (typeof item === "string" && item.trim().length > 0) {
-            seen.add(item.trim());
+        if (typeof item === "string") {
+            const cleaned = sanitizeExternalText(item, 300);
+            if (cleaned.length > 0) {
+                seen.add(cleaned);
+            }
         }
     }
     return [...seen];
@@ -3305,34 +3469,34 @@ function formatOverturePlace(
     const addr = Array.isArray(row.addresses) && row.addresses[0] && typeof row.addresses[0] === "object"
         ? row.addresses[0]
         : null;
-    const brandName = typeof row.brand?.names?.primary === "string" ? row.brand.names.primary : null;
-    const brandWikidata = typeof row.brand?.wikidata === "string" ? row.brand.wikidata : null;
+    const brandName = typeof row.brand?.names?.primary === "string" ? sanitizeExternalText(row.brand.names.primary, 200) || null : null;
+    const brandWikidata = typeof row.brand?.wikidata === "string" ? sanitizeExternalText(row.brand.wikidata, 80) || null : null;
 
     return {
-        id: typeof row.id === "string" ? row.id : indexFallbackId,
-        name: typeof row.names?.primary === "string" ? row.names.primary : null,
-        basic_category: typeof row.basic_category === "string" ? row.basic_category : null,
-        primary_category: typeof row.taxonomy?.primary === "string" ? row.taxonomy.primary : null,
+        id: typeof row.id === "string" ? sanitizeExternalText(row.id, 150) || indexFallbackId : indexFallbackId,
+        name: typeof row.names?.primary === "string" ? sanitizeExternalText(row.names.primary, 300) || null : null,
+        basic_category: typeof row.basic_category === "string" ? sanitizeExternalText(row.basic_category, 100) || null : null,
+        primary_category: typeof row.taxonomy?.primary === "string" ? sanitizeExternalText(row.taxonomy.primary, 100) || null : null,
         alternate_categories: normalizeStringArray(row.taxonomy?.alternates),
         category_hierarchy: normalizeStringArray(row.taxonomy?.hierarchy),
         confidence: typeof row.confidence === "number" && Number.isFinite(row.confidence) ? Number(row.confidence.toFixed(4)) : null,
-        operating_status: typeof row.operating_status === "string" ? row.operating_status : null,
+        operating_status: typeof row.operating_status === "string" ? sanitizeExternalText(row.operating_status, 50) || null : null,
         brand: brandName || brandWikidata ? { name: brandName, wikidata: brandWikidata } : null,
         coordinates: { lat: Number(coords.lat.toFixed(6)), lon: Number(coords.lon.toFixed(6)) },
         distance_meters: Math.round(calculateHaversineDistanceMeters(refCenter.lat, refCenter.lng, coords.lat, coords.lon)),
         address: addr
             ? {
-                freeform: typeof addr.freeform === "string" ? addr.freeform : null,
-                locality: typeof addr.locality === "string" ? addr.locality : null,
-                postcode: typeof addr.postcode === "string" ? addr.postcode : null,
-                region: typeof addr.region === "string" ? addr.region : null,
-                country: typeof addr.country === "string" ? addr.country : null,
+                freeform: typeof addr.freeform === "string" ? sanitizeExternalText(addr.freeform, 300) || null : null,
+                locality: typeof addr.locality === "string" ? sanitizeExternalText(addr.locality, 120) || null : null,
+                postcode: typeof addr.postcode === "string" ? sanitizeExternalText(addr.postcode, 40) || null : null,
+                region: typeof addr.region === "string" ? sanitizeExternalText(addr.region, 80) || null : null,
+                country: typeof addr.country === "string" ? sanitizeExternalText(addr.country, 80) || null : null,
             }
             : null,
-        websites: normalizeStringArray(row.websites),
+        websites: normalizeHttpUrlArray(row.websites),
         phones: normalizeStringArray(row.phones),
         emails: normalizeStringArray(row.emails),
-        socials: normalizeStringArray(row.socials),
+        socials: normalizeHttpUrlArray(row.socials),
         sources: extractOvertureSources(row.sources),
         version: typeof row.version === "number" ? row.version : null,
     };
@@ -5042,11 +5206,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         else if (toolName === "search_overpass") {
             const args = request.params.arguments || {};
-            const queryRaw = args.query as string;
-            const limit = (args.limit as number) || 100;
-            const offset = (args.offset as number) || 0;
-            const timeoutSec = (args.timeout_seconds as number) || 25;
+            const queryRaw = typeof args.query === 'string' ? args.query : '';
+            const rawLimit = typeof args.limit === 'number' && Number.isFinite(args.limit) ? Math.floor(args.limit) : 100;
+            const limit = Math.max(1, Math.min(1000, rawLimit));
+            const rawOffset = typeof args.offset === 'number' && Number.isFinite(args.offset) ? Math.floor(args.offset) : 0;
+            const offset = Math.max(0, rawOffset);
+            const timeoutSec = parseClampedTimeoutSec(args.timeout_seconds, 25);
             const useAreaBoundary = args.use_area_boundary !== false;
+            if (args.radius_meters !== undefined && (typeof args.radius_meters !== 'number' || !Number.isFinite(args.radius_meters) || args.radius_meters <= 0)) {
+                return { content: [{ type: "text", text: "Error: 'radius_meters' must be a positive finite number." }], isError: true };
+            }
             const radiusMeters = args.radius_meters as number | undefined;
             const returnGeometry = args.return_geometry as boolean || false;
             const countOnly = args.count_only as boolean || false;
@@ -5055,11 +5224,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (!queryRaw) {
                 return { content: [{ type: "text", text: "Error: 'query' is required (e.g. `node[\"amenity\"=\"restaurant\"]`)." }], isError: true };
             }
-            if (queryRaw.length > 2000) {
-                return { content: [{ type: "text", text: "Error: Query is too long (maximum 2000 characters)." }], isError: true };
-            }
-            if (queryRaw.includes("[out:") || queryRaw.includes("[timeout:") || queryRaw.includes("[bbox:")) {
-                return { content: [{ type: "text", text: "Error: Query must not contain [out:], [timeout:], or [bbox:] directives. The server handles these automatically." }], isError: true };
+            const queryValidationErr = validateOverpassQuery(queryRaw);
+            if (queryValidationErr) {
+                return { content: [{ type: "text", text: queryValidationErr }], isError: true };
             }
 
             const warnings: string[] = [];
@@ -5183,13 +5350,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const lon = e.lon ?? e.center?.lon ?? e.geometry?.[0]?.lon;
                 if (lat !== undefined && lon !== undefined) {
                     const distM = calculateHaversineDistanceMeters(refPoint.lat, refPoint.lng, lat, lon);
+                    const cleanTags = sanitizeExternalTags(e.tags || {});
                     const el: any = {
                         id: e.id,
                         type: e.type,
-                        name: e.tags?.name || "Unnamed",
+                        name: cleanTags.name || "Unnamed",
                         coordinates: { lat, lon },
                         distance_meters: Math.round(distM * 10) / 10,
-                        tags: e.tags || {}
+                        tags: cleanTags
                     };
                     if (returnGeometry && e.geometry) {
                         el.geometry = e.geometry;
@@ -5382,10 +5550,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         else if (toolName === "aggregate_overpass_h3") {
             const args = request.params.arguments || {};
-            const queryRaw = args.query as string;
+            const queryRaw = typeof args.query === 'string' ? args.query : '';
             const resolution = (args.resolution as number) ?? 8;
-            const timeoutSec = (args.timeout_seconds as number) || 25;
+            const timeoutSec = parseClampedTimeoutSec(args.timeout_seconds, 25);
             const useAreaBoundary = args.use_area_boundary !== false;
+            if (args.radius_meters !== undefined && (typeof args.radius_meters !== 'number' || !Number.isFinite(args.radius_meters) || args.radius_meters <= 0)) {
+                return { content: [{ type: "text", text: "Error: 'radius_meters' must be a positive finite number." }], isError: true };
+            }
             const radiusMeters = args.radius_meters as number | undefined;
             const useCircle = typeof radiusMeters === 'number' && radiusMeters > 0;
             const warnings: string[] = [];
@@ -5393,11 +5564,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (!queryRaw) {
                 return { content: [{ type: "text", text: "Error: 'query' is required." }], isError: true };
             }
-            if (queryRaw.length > 2000) {
-                return { content: [{ type: "text", text: "Error: Query is too long (maximum 2000 characters)." }], isError: true };
-            }
-            if (queryRaw.includes("[out:") || queryRaw.includes("[timeout:") || queryRaw.includes("[bbox:")) {
-                return { content: [{ type: "text", text: "Error: Query must not contain [out:], [timeout:], or [bbox:] directives." }], isError: true };
+            const queryValidationErr = validateOverpassQuery(queryRaw);
+            if (queryValidationErr) {
+                return { content: [{ type: "text", text: queryValidationErr }], isError: true };
             }
 
             if (resolution < 0 || resolution > 15 || !Number.isInteger(resolution)) {
@@ -5477,7 +5646,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     if (!hexElements[h3Index]) hexElements[h3Index] = [];
                     hexElements[h3Index].push({
                         id: e.id,
-                        name: e.tags?.name || "Unnamed"
+                        name: sanitizeExternalText(e.tags?.name, 200) || "Unnamed"
                     });
                 }
             });
@@ -6505,7 +6674,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const args = request.params.arguments || {};
             const includeCrossings = args.include_crossings === true;
             const countOnly = args.count_only === true;
-            const timeoutSec = (args.timeout_seconds as number) || 25;
+            const timeoutSec = parseClampedTimeoutSec(args.timeout_seconds, 25);
             const useAreaBoundary = args.use_area_boundary !== false;
             const rawLimit = typeof args.limit === 'number' ? Math.floor(args.limit) : 200;
             const limit = Math.max(1, Math.min(1000, rawLimit));
@@ -6692,12 +6861,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     continue;
                 }
 
+                const cleanTags = sanitizeExternalTags(e.tags || {});
                 const entry: any = {
                     id: e.id,
                     type: e.type,
                     control: kind,
-                    ...(e.tags?.name ? { name: e.tags.name } : {}),
-                    tags: e.tags || {}
+                    ...(cleanTags.name ? { name: cleanTags.name } : {}),
+                    tags: cleanTags
                 };
 
                 if (lat !== undefined && lon !== undefined) {
@@ -7131,13 +7301,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     summaryLines.push(`Showing ${offset + 1}-${offset + page.length} of ${sorted.length}:`);
                     for (const p of page) {
                         const confStr = p.confidence !== null ? `conf ${p.confidence.toFixed(2)}` : "conf n/a";
-                        const catStr = p.basic_category || p.primary_category || "place";
-                        const addrStr = p.address?.freeform ? ` — ${p.address.freeform}` : "";
+                        const catStr = escapeMarkdownInline(p.basic_category || p.primary_category || "place");
+                        const addrStr = p.address?.freeform ? ` — ${escapeMarkdownInline(p.address.freeform)}` : "";
                         const extras: string[] = [];
-                        if (p.phones[0]) extras.push(p.phones[0]);
-                        if (p.websites[0]) extras.push(p.websites[0]);
+                        if (p.phones[0]) extras.push(escapeMarkdownInline(p.phones[0]));
+                        if (p.websites[0]) extras.push(escapeMarkdownInline(p.websites[0]));
                         const extraStr = extras.length > 0 ? ` (${extras.join(", ")})` : "";
-                        summaryLines.push(`- **${p.name || "(unnamed)"}** [\`${catStr}\`, ${confStr}, ${p.distance_meters}m]${addrStr}${extraStr}`);
+                        summaryLines.push(`- **${escapeMarkdownInline(p.name || "(unnamed)")}** [\`${catStr}\`, ${confStr}, ${p.distance_meters}m]${addrStr}${extraStr}`);
                     }
                     if (hasMore && nextOffset !== null) {
                         summaryLines.push(`More results available (pass \`offset: ${nextOffset}\`).`);

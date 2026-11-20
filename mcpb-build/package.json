@@ -1,6 +1,6 @@
 {
   "name": "bbox-mcp-server-bundle",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "private": true,
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",

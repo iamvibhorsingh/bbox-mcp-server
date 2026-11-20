@@ -1,7 +1,7 @@
 {
     "name": "bbox-mcp-server",
     "mcpName": "io.github.iamvibhorsingh/bbox-mcp-server",
-    "version": "1.7.0",
+    "version": "1.7.1",
     "description": "The geospatial toolkit for AI agents — query, route, elevate, convert, and verify spatial data with zero config. 12 tools for bounding boxes, coordinate projection, H3 indexing, Overture Maps Places search, OpenStreetMap Overpass queries, traffic control checks, OSRM routing, Copernicus DEM elevation, spatial geometry math, and shareable map verification links.",
     "type": "module",
     "license": "MIT",
